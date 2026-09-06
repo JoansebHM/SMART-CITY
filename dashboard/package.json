@@ -1,0 +1,22 @@
+{
+  "name": "ciudad-autoadaptable-dashboard",
+  "version": "1.0.0",
+  "description": "Puente serial-WebSocket y dashboard web para la maqueta Ciudad Autoadaptable (ESP32-S3)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "simular": "node --env-file-if-exists=.env server.js --simular",
+    "puertos": "node server.js --listar-puertos",
+    "verificar-catalogo": "node verificar-catalogo.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.21.0",
+    "@serialport/parser-readline": "^12.0.0",
+    "express": "^5.2.1",
+    "serialport": "^12.0.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ciudad Autoadaptable — Panel</title>
+  <link rel="stylesheet" href="estilos.css">
+</head>
+<body>
+
+<header class="barra">
+  <div class="titulo">
+    <span class="marca">◉</span>
+    <div>
+      <h1>Ciudad Autoadaptable</h1>
+      <p class="sub">Panel de control y simulación · ESP32-S3</p>
+    </div>
+  </div>
+  <div class="indicadores">
+    <span id="pastillaEnlace" class="pastilla desconectado">
+      <i class="punto"></i><span id="textoEnlace">Conectando…</span>
+    </span>
+    <a class="boton-link" href="/api/exportar.csv">Exportar CSV</a>
+  </div>
+</header>
+
+<main class="grilla">
+
+  <!-- ================= VISTA DE LA MAQUETA ================= -->
+  <section class="tarjeta mapa">
+    <h2>Vista del cruce</h2>
+    <svg id="cruce" viewBox="0 0 460 470" role="img" aria-label="Vista superior del cruce">
+      <!-- Terreno -->
+      <rect x="0" y="0" width="460" height="470" fill="var(--cesped)"/>
+
+      <!-- Calles: la horizontal cruza todo; la vertical baja desde el cruce -->
+      <rect x="0" y="115" width="460" height="70" fill="var(--asfalto)"/>
+      <rect x="115" y="115" width="70" height="355" fill="var(--asfalto)"/>
+
+      <!-- Lineas centrales discontinuas -->
+      <line x1="200" y1="150" x2="460" y2="150" class="linea-via"/>
+      <line x1="150" y1="200" x2="150" y2="470" class="linea-via"/>
+
+      <!-- Cruces peatonales -->
+      <g class="cebra">
+        <rect x="194" y="119" width="5" height="62"/><rect x="204" y="119" width="5" height="62"/>
+        <rect x="214" y="119" width="5" height="62"/>
+        <rect x="119" y="194" width="62" height="5"/><rect x="119" y="204" width="62" height="5"/>
+        <rect x="119" y="214" width="62" height="5"/>
+      </g>
+
+      <!-- Sentido del trafico -->
+      <text x="360" y="107" class="flecha">◄ Calle 1</text>
+      <text x="100" y="380" class="flecha" transform="rotate(-90 100 380)">Calle 2 ►</text>
+
+      <!-- ---- Sensores CNY de la Calle 1 (a la derecha del cruce) ---- -->
+      <g class="sensor" data-cny="2" transform="translate(245,150)">
+        <rect class="marca-sensor" x="-11" y="-11" width="22" height="22" rx="4"/>
+        <text class="etiqueta" y="45">CNY3</text>
+      </g>
+      <g class="sensor" data-cny="1" transform="translate(320,150)">
+        <rect class="marca-sensor" x="-11" y="-11" width="22" height="22" rx="4"/>
+        <text class="etiqueta" y="45">CNY2</text>
+      </g>
+      <g class="sensor" data-cny="0" transform="translate(395,150)">
+        <rect class="marca-sensor" x="-11" y="-11" width="22" height="22" rx="4"/>
+        <text class="etiqueta" y="45">CNY1</text>
+      </g>
+
+      <!-- ---- Sensores CNY de la Calle 2 (debajo del cruce) ---- -->
+      <g class="sensor" data-cny="5" transform="translate(150,250)">
+        <rect class="marca-sensor" x="-11" y="-11" width="22" height="22" rx="4"/>
+        <text class="etiqueta" x="48" y="5">CNY6</text>
+      </g>
+      <g class="sensor" data-cny="4" transform="translate(150,325)">
+        <rect class="marca-sensor" x="-11" y="-11" width="22" height="22" rx="4"/>
+        <text class="etiqueta" x="48" y="5">CNY5</text>
+      </g>
+      <g class="sensor" data-cny="3" transform="translate(150,400)">
+        <rect class="marca-sensor" x="-11" y="-11" width="22" height="22" rx="4"/>
+        <text class="etiqueta" x="48" y="5">CNY4</text>
+      </g>
+
+      <!-- ---- Carros (se muestran sobre el sensor que los detecta) ---- -->
+      <g id="carros"></g>
+
+      <!-- ---- Semaforo 1 (arriba del cruce, en el cesped) ---- -->
+      <g transform="translate(212,32)">
+        <rect class="caja-semaforo" x="0" y="0" width="26" height="62" rx="6"/>
+        <circle id="led-lr1" class="bombillo" cx="13" cy="14" r="8"/>
+        <circle id="led-ly1" class="bombillo" cx="13" cy="31" r="8"/>
+        <circle id="led-lg1" class="bombillo" cx="13" cy="48" r="8"/>
+        <text class="etiqueta" x="13" y="76">Semáforo 1</text>
+      </g>
+
+      <!-- ---- Semaforo 2 (a la izquierda de la calle vertical) ---- -->
+      <g transform="translate(62,238)">
+        <rect class="caja-semaforo" x="0" y="0" width="26" height="62" rx="6"/>
+        <circle id="led-lr2" class="bombillo" cx="13" cy="14" r="8"/>
+        <circle id="led-ly2" class="bombillo" cx="13" cy="31" r="8"/>
+        <circle id="led-lg2" class="bombillo" cx="13" cy="48" r="8"/>
+        <text class="etiqueta" x="13" y="76">Semáforo 2</text>
+      </g>
+
+      <!-- ---- Botones peatonales ---- -->
+      <g id="peaton1" class="peaton" transform="translate(175,55)">
+        <circle r="10"/><text class="etiqueta-peaton" y="4">P1</text>
+      </g>
+      <g id="peaton2" class="peaton" transform="translate(32,225)">
+        <circle r="10"/><text class="etiqueta-peaton" y="4">P2</text>
+      </g>
+
+      <!-- ---- Sensores de ambiente ---- -->
+      <g class="ambiente" transform="translate(272,55)">
+        <circle id="ldr1Punto" r="8"/><text class="etiqueta" y="26">LDR1</text>
+      </g>
+      <g class="ambiente" transform="translate(32,320)">
+        <circle id="ldr2Punto" r="8"/><text class="etiqueta" y="26">LDR2</text>
+      </g>
+      <g class="ambiente" transform="translate(400,420)">
+        <circle id="co2Punto" r="10"/><text class="etiqueta" y="28">CO₂</text>
+      </g>
+    </svg>
+  </section>
+
+  <!-- ================= ESTADO ================= -->
+  <aside class="columna-estado">
+    <div class="tarjeta fase-actual">
+      <h2>Fase actual</h2>
+      <p id="faseTexto" class="dato-grande">—</p>
+      <div class="barra-tiempo"><div id="barraFase"></div></div>
+      <p class="pie"><span id="restante">—</span> restantes ·
+        verde calculado <span id="verdeCalc">—</span></p>
+      <p id="avisoManual" class="aviso oculto">Semáforo en modo MANUAL</p>
+      <p id="avisoPrioridad" class="aviso urgente oculto"></p>
+    </div>
+
+    <div class="tarjeta">
+      <h2>Tráfico</h2>
+      <div class="par-metricas">
+        <div><span class="etiqueta-metrica">Calle 1</span><span id="autos1" class="dato-medio">0</span></div>
+        <div><span class="etiqueta-metrica">Calle 2</span><span id="autos2" class="dato-medio">0</span></div>
+      </div>
+      <div id="tirasCny" class="tiras"></div>
+    </div>
+
+    <div class="tarjeta">
+      <h2>Ambiente</h2>
+      <div class="medidor">
+        <div class="medidor-cabecera"><span>CO₂</span><span id="co2Valor">—</span></div>
+        <div class="medidor-riel"><div id="co2Barra" class="medidor-relleno"></div></div>
+      </div>
+      <div class="medidor">
+        <div class="medidor-cabecera"><span>LDR1</span><span id="ldr1Valor">—</span></div>
+        <div class="medidor-riel"><div id="ldr1Barra" class="medidor-relleno azul"></div></div>
+      </div>
+      <div class="medidor">
+        <div class="medidor-cabecera"><span>LDR2</span><span id="ldr2Valor">—</span></div>
+        <div class="medidor-riel"><div id="ldr2Barra" class="medidor-relleno azul"></div></div>
+      </div>
+      <div class="fila-insignias">
+        <span id="insigniaNoche" class="insignia">Día</span>
+        <span id="insigniaCo2" class="insignia">CO₂ normal</span>
+        <span id="insigniaPeaton" class="insignia">Sin peatones</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ================= HISTORIAL ================= -->
+  <section class="tarjeta grafica">
+    <h2>Histórico <span class="tenue">últimos minutos</span></h2>
+    <svg id="lienzoGrafica" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+    <div class="leyenda-grafica">
+      <span><i class="muestra naranja"></i>CO₂</span>
+      <span><i class="muestra verde"></i>Autos totales</span>
+      <span><i class="muestra azul"></i>Luz promedio</span>
+    </div>
+  </section>
+
+  <!-- ================= CHAT CON LA IA ================= -->
+  <section class="tarjeta chat">
+    <h2>Control por voz escrita
+      <span id="pastillaIa" class="pastilla-mini">—</span>
+      <button id="olvidarIa" class="mini">olvidar contexto</button>
+    </h2>
+    <div id="hiloChat" class="hilo">
+      <div class="burbuja sistema">
+        Escríbeme una orden en lenguaje natural. Por ejemplo:
+        <em>«viene una ambulancia con urgencia por la calle 10»</em>, y cuando pase,
+        <em>«ya pasó, vuelve a la normalidad»</em>.
+      </div>
+    </div>
+    <form id="formChat" class="comando-libre">
+      <input id="entradaChat" type="text" placeholder="Dile qué quieres que haga la ciudad…" autocomplete="off">
+      <button type="submit">Enviar</button>
+    </form>
+    <div class="sugerencias" id="sugerencias"></div>
+  </section>
+
+  <!-- ================= CONTROLES ================= -->
+  <section class="tarjeta controles">
+    <h2>Panel de simulación</h2>
+    <div id="gruposControles"></div>
+    <form id="formComando" class="comando-libre">
+      <input id="entradaComando" type="text" placeholder="Comando manual (ej. cny 3 on)" autocomplete="off">
+      <button type="submit">Enviar</button>
+    </form>
+  </section>
+
+  <!-- ================= CONSOLA ================= -->
+  <section class="tarjeta consola">
+    <h2>Consola de la placa <button id="limpiarConsola" class="mini">limpiar</button></h2>
+    <div id="salidaConsola" class="salida"></div>
+  </section>
+
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
