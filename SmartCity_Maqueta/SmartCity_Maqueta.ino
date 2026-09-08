@@ -115,9 +115,8 @@ const unsigned long EXTENSION_POR_AUTO = 2000;
 const unsigned long TIEMPO_AMARILLO    = 3000;
 const unsigned long TIEMPO_TODO_ROJO   = 1000;
 
-const int UMBRAL_NOCHE = 800;
+const int UMBRAL_NOCHE = 1000;
 const int BRILLO_DIA   = 255;
-const int BRILLO_NOCHE = 60;
 const int UMBRAL_CO2_ALTO = 2500;
 
 const unsigned long DEBOUNCE_MS = 200;
@@ -177,6 +176,30 @@ int autosCalle2Actual = 0;
 // --- Que pantalla de informacion se esta mostrando ahora mismo (0 a 3) ---
 int modoPantalla = 0;
 
+
+// ---------- Variables para la hora indicada por Serial ----------
+bool horaNocheProfundaIndicada = false; // true si la última hora recibida está en 23h-4h
+int horaActualIndicada = -1;            // -1 = aún no se ha recibido ninguna hora
+
+// ---------- Variables para el modo de parpadeo especial ----------
+bool modoNocheProfundaActivo = false;
+bool estadoParpadeoNocheProfunda = false;
+unsigned long tUltimoParpadeoNocheProfunda = 0;
+const unsigned long INTERVALO_PARPADEO_NOCHE = 400;
+
+bool advertenciaHoraMostrada = false; // evita spamear el mensaje de error cada 50ms
+
+// ---------- Variables de estado de la emergencia ----------
+bool emergenciaCO2Activa = false;
+
+// ============================================================================
+// LED RGB integrado: refleja visualmente el nivel de CO2
+//   Verde    -> CO2 normal (por debajo de UMBRAL_CO2_ALTO)
+//   Amarillo -> CO2 medio (entre UMBRAL_CO2_ALTO y UMBRAL_CO2_EMERGENCIA)
+//   Rojo     -> CO2 en peligro (por encima de UMBRAL_CO2_EMERGENCIA)
+// ============================================================================
+const uint8_t NIVEL_LED_RGB = 40; // brillo maximo por canal (0-255), evita encandilar
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -217,6 +240,8 @@ void setup() {
   delay(1500);
   lcd.clear();
 
+  rgbLedWrite(RGB_BUILTIN, 0, 0, 0); // apagado inicial
+
   tiempoInicioFase = millis();
   duracionVerdeCalculada = VERDE_MINIMO;
   aplicarSemaforos();
@@ -226,12 +251,25 @@ void setup() {
 // LOOP PRINCIPAL
 // ============================================================================
 void loop() {
-  leerSensoresDetalle();       // lee LDRs, CNYs y cuenta autos (para logica y pantalla)
-  leerBotones();                // detecta P1, P2 y combos P1+P2
+  leerComandosSerial();        
+  leerSensoresDetalle();
+  leerBotones();
   actualizarModoNoche();
   leerCO2();
-  actualizarMaquinaEstados();
-  actualizarLCD();
+  actualizarLedRGB();
+  actualizarEmergenciaCO2();
+  
+  if (!emergenciaCO2Activa) {
+    actualizarMaquinaEstados();
+    actualizarNocheProfunda();
+    actualizarLCD();
+  } else {
+    static unsigned long ultimaActualizacionEmergencia = 0;
+    if (millis() - ultimaActualizacionEmergencia >= 500) {
+      dibujarPantallaEmergenciaCO2();
+      ultimaActualizacionEmergencia = millis();
+    }
+  }
 
   delay(50);
 }
@@ -414,9 +452,6 @@ unsigned long calcularDuracionVerde(int autosDetectados) {
   unsigned long duracion = VERDE_MINIMO + (autosDetectados * EXTENSION_POR_AUTO);
 
   unsigned long maximoPermitido = VERDE_MAXIMO;
-  if (co2Actual >= UMBRAL_CO2_ALTO) {
-    maximoPermitido = VERDE_MINIMO + (EXTENSION_POR_AUTO * 2);
-  }
 
   if (duracion > maximoPermitido) duracion = maximoPermitido;
   if (duracion < VERDE_MINIMO) duracion = VERDE_MINIMO;
@@ -469,8 +504,8 @@ void escribirLuz(int pin, bool encendido) {
     analogWrite(pin, 0);
     return;
   }
-  int brillo = modoNoche ? BRILLO_NOCHE : BRILLO_DIA;
-  analogWrite(pin, brillo);
+  
+  analogWrite(pin, BRILLO_DIA);
 }
 
 // ============================================================================
@@ -488,6 +523,85 @@ void actualizarLCD() {
     case 1: dibujarPantallaCalle1();    break;
     case 2: dibujarPantallaCalle2();    break;
     case 3: dibujarPantallaSistema();   break;
+  }
+}
+
+// ============================================================================
+// MODO NOCTURNO PROFUNDO: LY1 y LR2 parpadean SOLO si ambos LDR detectan
+// baja luz Y la hora indicada por Serial cae en 23h-4h.
+// ============================================================================
+void actualizarNocheProfunda() {
+  bool ambosLdrBajos = (luz1Actual < UMBRAL_NOCHE) && (luz2Actual < UMBRAL_NOCHE);
+
+  if (horaNocheProfundaIndicada && ambosLdrBajos) {
+    // --- Condición cumplida: activa/mantiene el parpadeo ---
+    modoNocheProfundaActivo = true;
+    advertenciaHoraMostrada = false;
+
+    unsigned long ahora = millis();
+    if (ahora - tUltimoParpadeoNocheProfunda >= INTERVALO_PARPADEO_NOCHE) {
+      estadoParpadeoNocheProfunda = !estadoParpadeoNocheProfunda;
+      tUltimoParpadeoNocheProfunda = ahora;
+    }
+
+    int brillo = BRILLO_DIA;
+
+    // Apaga el resto de luces de ambos semaforos
+    analogWrite(LR1, 0);
+    analogWrite(LG1, 0);
+    analogWrite(LG2, 0);
+    analogWrite(LY2, 0);
+
+    // Parpadean juntos LY1 y LR2
+    analogWrite(LY1, estadoParpadeoNocheProfunda ? brillo : 0);
+    analogWrite(LR2, estadoParpadeoNocheProfunda ? brillo : 0);
+
+  } else {
+    // --- Condición NO cumplida: libera el forzado si estaba activo ---
+    if (modoNocheProfundaActivo) {
+      modoNocheProfundaActivo = false;
+      aplicarSemaforos(); // vuelve al ciclo normal (o al dimming nocturno normal)
+    }
+
+    // --- Caso de inconsistencia: se indicó la hora pero los sensores
+    //     no confirman baja luz en ambas vias ---
+    if (horaNocheProfundaIndicada && !ambosLdrBajos) {
+      if (!advertenciaHoraMostrada) {
+        Serial.println(F("ADVERTENCIA: se indico horario 23h-4h pero los sensores no detectan baja luz en ambas vias. No es la hora correcta."));
+        advertenciaHoraMostrada = true;
+      }
+    } else {
+      advertenciaHoraMostrada = false;
+    }
+  }
+}
+
+// ============================================================================
+// EMERGENCIA POR CO2: si el nivel supera el umbral de emergencia, se congela
+// la maquina de estados normal, se fuerza LG2+LR1, y la pantalla muestra
+// un aviso de peligro. Se mantiene asi mientras el nivel siga alto.
+// Al bajar, el sistema vuelve exactamente al comportamiento normal.
+// ============================================================================
+void actualizarEmergenciaCO2() {
+  bool nivelPeligroso = co2Actual > UMBRAL_CO2_ALTO;
+
+  if (nivelPeligroso && !emergenciaCO2Activa) {
+    // --- Entrando a emergencia ---
+    emergenciaCO2Activa = true;
+    Serial.println(F("EMERGENCIA CO2: nivel critico detectado. Forzando evacuacion Calle 2."));
+  } else if (!nivelPeligroso && emergenciaCO2Activa) {
+    // --- Saliendo de emergencia: el sistema vuelve a comportarse normal ---
+    emergenciaCO2Activa = false;
+    tiempoInicioFase = millis(); // evita que la fase recupere tiempo "perdido" durante la emergencia
+    aplicarSemaforos();
+    Serial.println(F("CO2 normalizado. Reanudando operacion normal."));
+  }
+
+  if (emergenciaCO2Activa) {
+    escribirLuz(LR1, false); escribirLuz(LY1, false); escribirLuz(LG1, false);
+    escribirLuz(LR2, false); escribirLuz(LY2, false); escribirLuz(LG2, false);
+    escribirLuz(LG2, true);
+    escribirLuz(LR1, true);
   }
 }
 
@@ -551,6 +665,39 @@ String nombreFaseLarga() {
   return "";
 }
 
+// ============================================================================
+// LECTURA DE COMANDOS POR SERIAL (protocolo: "HORA:<0-23>")
+// ============================================================================
+void leerComandosSerial() {
+  if (Serial.available() > 0) {
+    String comando = Serial.readStringUntil('\n');
+    comando.trim();
+
+    if (comando.startsWith("HORA:")) {
+      int hora = comando.substring(5).toInt();
+      if (hora >= 0 && hora <= 23) {
+        horaActualIndicada = hora;
+        horaNocheProfundaIndicada = (hora >= 23 || hora <= 4);
+        Serial.print(F("Hora recibida: "));
+        Serial.print(hora);
+        Serial.println(horaNocheProfundaIndicada ? F("h (dentro de 23h-4h)") : F("h (fuera de ese rango)"));
+      } else {
+        Serial.println(F("Formato invalido. Usa HORA:0 a HORA:23"));
+      }
+    }
+  }
+}
+
+void actualizarLedRGB() {
+  if (co2Actual > UMBRAL_CO2_ALTO) {
+    rgbLedWrite(RGB_BUILTIN, NIVEL_LED_RGB, 0, 0); // rojo
+  } else if (co2Actual >= UMBRAL_CO2_ALTO) {
+    rgbLedWrite(RGB_BUILTIN, NIVEL_LED_RGB, NIVEL_LED_RGB, 0); // amarillo
+  } else {
+    rgbLedWrite(RGB_BUILTIN, 0, NIVEL_LED_RGB, 0); // verde
+  }
+}
+
 // --- MODO 1: Resumen general de todo el cruce ---
 void dibujarPantallaResumen() {
   imprimirFila(0, "C1:" + faseCortaCalle1() + " C2:" + faseCortaCalle2() + "   M1");
@@ -585,4 +732,14 @@ void dibujarPantallaSistema() {
   imprimirFila(1, "CO2 crudo:" + String(co2Actual));
   imprimirFila(2, "Luz1:" + String(luz1Actual) + " Luz2:" + String(luz2Actual));
   imprimirFila(3, nombreFaseLarga() + " " + String(tiempoRestanteFase()) + "s");
+}
+
+// ============================================================================
+// PANTALLA DE EMERGENCIA POR CO2
+// ============================================================================
+void dibujarPantallaEmergenciaCO2() {
+  imprimirFila(0, "!! PELIGRO !!");
+  imprimirFila(1, "CO2 CRITICO");
+  imprimirFila(2, "Valor:" + String(co2Actual));
+  imprimirFila(3, "Evacuando Calle 2");
 }
