@@ -257,7 +257,8 @@ export const COMANDOS = [
   {
     nombre: 'co2', categoria: 'ambiente',
     sintaxis: 'co2 <0-4095|alto|bajo|auto>',
-    que: 'Simula la calidad del aire. Con CO2 alto el sistema recorta el verde maximo.',
+    que: 'Simula la calidad del aire. Al llegar a umbralco2 el sistema entra en EMERGENCIA: congela el ciclo, fuerza LG2+LR1 para evacuar por la Calle 2, el LCD muestra "CO2 CRITICO" y el LED RGB de la placa se pone rojo. Por debajo del umbral solo recorta el verde maximo.',
+    ojo: 'La emergencia manda sobre todo: mientras dure, ni "led", ni "fase", ni "parpadeo", ni la noche profunda tocan los semaforos. Se sale bajando el CO2 ("co2 bajo" o "co2 auto").',
     args: [{ tipo: 'texto', patron: /^(alto|bajo|auto|\d{1,4})$/ }],
     ejemplos: ['co2 alto', 'co2 auto']
   },
@@ -268,6 +269,14 @@ export const COMANDOS = [
     ojo: 'Solo baja el brillo de los LEDs (brillonoche); NO pone los semaforos en amarillo intermitente. Eso es "escenario intermitente".',
     args: [{ tipo: 'enum', valores: ['on', 'off', 'auto'] }],
     ejemplos: ['noche on', 'noche auto']
+  },
+  {
+    nombre: 'hora', categoria: 'ambiente',
+    sintaxis: 'hora <0-23|off>',
+    que: 'Le dice al sistema que hora es (la placa no tiene reloj). Si la hora cae en la franja 23h-4h Y los dos LDR leen por debajo de umbralnoche, arranca la NOCHE PROFUNDA: LY1 y LR2 parpadean juntos y los demas LEDs se apagan.',
+    ojo: 'Por si sola no hace nada: hacen falta las DOS condiciones. Con la hora puesta pero con luz, el firmware solo avisa por consola. Para verlo de una usa "escenario madrugada". "hora off" olvida la hora.',
+    args: [{ tipo: 'texto', patron: /^(off|auto|limpiar|\d{1,2})$/ }],
+    ejemplos: ['hora 2', 'hora 14', 'hora off']
   },
 
   // ======================= PEATONES =======================
@@ -354,10 +363,10 @@ export const COMANDOS = [
   {
     nombre: 'escenario', categoria: 'escenarios',
     sintaxis: 'escenario <nombre>',
-    que: 'Aplica un escenario completo de una sola vez. trafico1/trafico2 = cola fija en esa calle; noche/dia = luz ambiente; contaminacion = CO2 alto y cola en ambas; vacio = sin autos y aire limpio; intermitente = los dos amarillos parpadeando (modo madrugada, deja el semaforo en manual); horapico = trafico continuo y variable en ambas.',
+    que: 'Aplica un escenario completo de una sola vez. trafico1/trafico2 = cola fija en esa calle; noche/dia = luz ambiente; madrugada = hora 2h + oscuridad en las dos vias, que dispara la noche profunda (LY1+LR2 intermitentes); contaminacion = CO2 alto (dispara la emergencia por CO2) y cola en ambas; vacio = sin autos y aire limpio; intermitente = los dos amarillos parpadeando (deja el semaforo en manual); horapico = trafico continuo y variable en ambas.',
     ojo: 'PREFIERELO a armar la misma situacion con varios comandos sueltos: el escenario ya deja el estado consistente. Se deshace con "reset".',
-    args: [{ tipo: 'enum', valores: ['trafico1', 'trafico2', 'noche', 'dia', 'contaminacion',
-                                     'vacio', 'intermitente', 'horapico'] }],
+    args: [{ tipo: 'enum', valores: ['trafico1', 'trafico2', 'noche', 'dia', 'madrugada',
+                                     'contaminacion', 'vacio', 'intermitente', 'horapico'] }],
     ejemplos: ['escenario horapico', 'escenario intermitente']
   },
 

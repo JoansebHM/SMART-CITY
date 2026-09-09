@@ -68,6 +68,18 @@ export class PlacaSimulada extends EventEmitter {
     this.programados = [];          // [{cuando, comando}]
     this.slots = {};                // instantaneas
 
+    // --- Hora indicada por consola y noche profunda (LY1 + LR2 intermitentes) ---
+    this.horaIndicada = -1;
+    this.horaMadrugada = false;
+    this.nocheProfunda = false;
+    this.parpNocheOn = false;
+    this.parpNocheUlt = 0;
+    this.avisoHora = false;
+    this.INTERVALO_PARPADEO_NOCHE = 400;
+
+    // --- Emergencia por CO2: congela el ciclo y evacua por la Calle 2 ---
+    this.emergenciaCO2 = false;
+
     // Valores "fisicos" que van derivando solos, para que se vea vivo
     this.ldrReal = [640, 620];
     this.co2Real = 1300;
@@ -132,21 +144,35 @@ export class PlacaSimulada extends EventEmitter {
   get leds() {
     // 0=LR1 1=LY1 2=LG1 3=LR2 4=LY2 5=LG2
     const on = [false, false, false, false, false, false];
-    switch (this.fase) {
-      case 'v1': on[2] = on[3] = true; break;
-      case 'a1': on[1] = on[3] = true; break;
-      case 'r1': on[0] = on[3] = true; break;
-      case 'v2': on[0] = on[5] = true; break;
-      case 'a2': on[0] = on[4] = true; break;
-      case 'r2': on[0] = on[3] = true; break;
+
+    // Los dos modos forzados mandan sobre la fase y sobre los override manuales.
+    const forzado = this.emergenciaCO2 || this.nocheProfunda;
+
+    if (this.emergenciaCO2) {
+      on[5] = true;   // LG2: evacuacion por la Calle 2
+      on[0] = true;   // LR1
+    } else if (this.nocheProfunda) {
+      on[1] = this.parpNocheOn;   // LY1
+      on[3] = this.parpNocheOn;   // LR2
+    } else {
+      switch (this.fase) {
+        case 'v1': on[2] = on[3] = true; break;
+        case 'a1': on[1] = on[3] = true; break;
+        case 'r1': on[0] = on[3] = true; break;
+        case 'v2': on[0] = on[5] = true; break;
+        case 'a2': on[0] = on[4] = true; break;
+        case 'r2': on[0] = on[3] = true; break;
+      }
     }
     const brillo = this.noche ? this.cfg.brillonoche : this.cfg.brillodia;
     const ahora = Date.now();
 
     const salida = on.map((encendido, i) => {
-      let v = this.simLed[i] >= 0 ? this.simLed[i] : encendido ? brillo : 0;
+      let v = forzado
+        ? (encendido ? brillo : 0)
+        : (this.simLed[i] >= 0 ? this.simLed[i] : encendido ? brillo : 0);
       v = Math.round((v * this.brilloMaestro) / 255);
-      if (this.parpadeo[i] > 0) {
+      if (!forzado && this.parpadeo[i] > 0) {
         if (ahora - this.parpadeoUlt[i] >= this.parpadeo[i]) {
           this.parpadeoUlt[i] = ahora;
           this.parpadeoOn[i] = !this.parpadeoOn[i];
@@ -187,6 +213,11 @@ export class PlacaSimulada extends EventEmitter {
     this.#atenderFlujo();
     this.#atenderWatchdog();
     this.#atenderPrioridad();
+    this.#atenderEmergenciaCO2();
+
+    // La emergencia por CO2 manda sobre todo: ni ciclo ni noche profunda.
+    if (this.emergenciaCO2) return;
+    this.#atenderNocheProfunda();
 
     if (!this.semAuto) return;
     const t = Date.now() - this.inicioFase;
@@ -260,6 +291,62 @@ export class PlacaSimulada extends EventEmitter {
     }
   }
 
+  // CO2 por encima del umbral: se congela el ciclo, se fuerza LG2+LR1 y el LCD
+  // avisa. Al normalizarse, todo vuelve al comportamiento normal.
+  #atenderEmergenciaCO2() {
+    const peligro = this.co2 >= this.cfg.umbralco2;
+
+    if (peligro && !this.emergenciaCO2) {
+      this.emergenciaCO2 = true;
+      this.nocheProfunda = false;
+      this.emit('consola', { nivel: 'evento', texto: '[EVENTO] EMERGENCIA CO2: nivel critico. Evacuacion por la Calle 2.' });
+    } else if (!peligro && this.emergenciaCO2) {
+      this.emergenciaCO2 = false;
+      this.inicioFase = Date.now();
+      this.emit('consola', { nivel: 'evento', texto: '[EVENTO] CO2 normalizado. Reanudando operacion normal.' });
+    }
+
+    if (this.emergenciaCO2 && this.fase !== 'v2') this.#cambiarFase('v2');
+  }
+
+  // Noche profunda: hace falta la hora en 23h-4h Y los DOS LDR por debajo del
+  // umbral. Mientras dure, LY1 y LR2 parpadean juntos.
+  #atenderNocheProfunda() {
+    const l = this.ldr;
+    const ambosBajos = l[0] < this.cfg.umbralnoche && l[1] < this.cfg.umbralnoche;
+
+    if (this.horaMadrugada && ambosBajos) {
+      if (!this.nocheProfunda) {
+        this.nocheProfunda = true;
+        this.parpNocheOn = true;
+        this.parpNocheUlt = Date.now();
+        this.emit('consola', { nivel: 'evento', texto: '[EVENTO] NOCHE PROFUNDA: intermitente LY1 + LR2.' });
+      }
+      this.avisoHora = false;
+      const ahora = Date.now();
+      if (ahora - this.parpNocheUlt >= this.INTERVALO_PARPADEO_NOCHE) {
+        this.parpNocheOn = !this.parpNocheOn;
+        this.parpNocheUlt = ahora;
+      }
+      return;
+    }
+
+    if (this.nocheProfunda) {
+      this.nocheProfunda = false;
+      this.inicioFase = Date.now();
+      this.emit('consola', { nivel: 'evento', texto: '[EVENTO] Fin de la noche profunda. Ciclo normal reanudado.' });
+    }
+
+    if (this.horaMadrugada && !ambosBajos) {
+      if (!this.avisoHora) {
+        this.avisoHora = true;
+        this.emit('consola', { nivel: 'evento', texto: '[EVENTO] ADVERTENCIA: hora en 23h-4h pero los LDR no ven poca luz en ambas vias.' });
+      }
+    } else {
+      this.avisoHora = false;
+    }
+  }
+
   #atenderWatchdog() {
     if (this.watchdogLimite === 0) return;
     if (Date.now() - this.watchdogUltimo < this.watchdogLimite) return;
@@ -324,8 +411,12 @@ export class PlacaSimulada extends EventEmitter {
       co2: this.co2,
       co2Sim: this.simCo2 >= 0,
       co2Alto: this.co2 >= this.cfg.umbralco2,
+      co2Emergencia: this.emergenciaCO2,
       noche: this.noche,
       nocheSim: this.simNoche,
+      hora: this.horaIndicada,
+      horaMadrugada: this.horaMadrugada,
+      nocheProfunda: this.nocheProfunda,
       ped: [this.ped[0] ? 1 : 0, this.ped[1] ? 1 : 0],
       leds: this.leds,
       ledSim: this.simLed,
@@ -574,6 +665,27 @@ export class PlacaSimulada extends EventEmitter {
         if (a1 === 'auto') { this.simNoche = -1; return this.#ok('Dia/noche segun LDR'); }
         return this.#err('Uso: noche <on|off|auto>');
       }
+      case 'hora': {
+        if (a1 === undefined) {
+          if (this.horaIndicada < 0) return this.#ok('Sin hora indicada. Uso: hora <0-23>');
+          return this.#ok(`Hora indicada: ${this.horaIndicada}h` +
+            (this.horaMadrugada ? ' (dentro de 23h-4h)' : ' (fuera de 23h-4h)'));
+        }
+        if (a1 === 'off' || a1 === 'auto' || a1 === 'limpiar') {
+          this.horaIndicada = -1;
+          this.horaMadrugada = false;
+          this.avisoHora = false;
+          return this.#ok('Hora olvidada: no habra noche profunda');
+        }
+        const h = num(a1);
+        if (h === null) return this.#err('Uso: hora <0-23>  /  hora off');
+        if (h > 23) return this.#err('Hora fuera de rango. Usa 0 a 23.');
+        this.horaIndicada = h;
+        this.horaMadrugada = h >= 23 || h <= 4;
+        this.avisoHora = false;
+        return this.#ok(`Hora recibida: ${h}h` +
+          (this.horaMadrugada ? ' (dentro de 23h-4h: madrugada)' : ' (fuera de ese rango)'));
+      }
       case 'p1': this.ped[0] = true; return this.emit('consola', { nivel: 'evento', texto: '[EVENTO] Peaton solicito cruce en Calle 1' });
       case 'p2': this.ped[1] = true; return this.emit('consola', { nivel: 'evento', texto: '[EVENTO] Peaton solicito cruce en Calle 2' });
       case 'combo': this.pantalla = (this.pantalla % 4) + 1; return this.emit('consola', { nivel: 'evento', texto: `[EVENTO] Pantalla LCD -> M${this.pantalla}` });
@@ -637,6 +749,10 @@ export class PlacaSimulada extends EventEmitter {
           trafico2: () => { this.modoCny = ['off', 'off', 'off', 'on', 'on', 'on']; },
           noche: () => { this.simLdr = [100, 100]; this.simNoche = -1; },
           dia: () => { this.simLdr = [3000, 3000]; this.simNoche = -1; },
+          madrugada: () => {
+            this.simLdr = [100, 100]; this.simNoche = -1;
+            this.horaIndicada = 2; this.horaMadrugada = true; this.avisoHora = false;
+          },
           contaminacion: () => { this.simCo2 = this.cfg.umbralco2 + 500; this.modoCny = Array(6).fill('on'); },
           vacio: () => { this.modoCny = Array(6).fill('off'); this.simCo2 = 100; },
           intermitente: () => {
@@ -652,7 +768,7 @@ export class PlacaSimulada extends EventEmitter {
             this.modoCny = Array(6).fill('auto');
           }
         }[a1];
-        if (!e) return this.#err('Escenarios: trafico1 trafico2 noche dia contaminacion vacio');
+        if (!e) return this.#err('Escenarios: trafico1 trafico2 noche dia madrugada contaminacion vacio intermitente horapico');
         e();
         return this.#ok(`Escenario: ${a1}`);
       }
@@ -677,6 +793,10 @@ export class PlacaSimulada extends EventEmitter {
         this.ped = [false, false];
         this.lcdTexto = '';
         this.programados = [];
+        this.horaIndicada = -1;
+        this.horaMadrugada = false;
+        this.nocheProfunda = false;
+        this.avisoHora = false;
         return this.#ok('Todo en AUTO');
       case 'mon':
       case 'json':

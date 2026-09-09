@@ -21,8 +21,14 @@
      1. TRAFICO   : mas sensores CNY activos en una calle => verde mas largo.
      2. PEATONES  : P1/P2 acortan el verde de su calle al minimo.
      3. LUZ (LDR) : de noche los LEDs bajan su brillo (PWM).
-     4. CO2       : si el aire esta cargado, se reduce el verde maximo.
+     4. CO2       : si el aire esta cargado, se reduce el verde maximo; el LED
+                    RGB de la placa lo indica (verde = OK, rojo = critico) y
+                    si pasa el umbral se entra en EMERGENCIA: el ciclo se
+                    congela con LG2+LR1 para evacuar por la Calle 2.
      5. LCD I2C   : 4 pantallas de informacion; se rotan con P1+P2 juntos.
+     6. HORA      : con el comando "hora <0-23>" se le dice al sistema que
+                    hora es. Si la hora cae en 23h-4h Y los dos LDR ven poca
+                    luz, se entra en NOCHE PROFUNDA: LY1 y LR2 parpadean.
 
    NOVEDAD: CONSOLA SERIAL
    -----------------------
@@ -262,6 +268,34 @@ struct Instantanea {
 Instantanea instantaneas[MAX_SLOTS];
 
 // ============================================================================
+// 9. HORA INDICADA POR SERIAL Y NOCHE PROFUNDA
+// ============================================================================
+// La placa no tiene reloj: la hora se le dice desde afuera con el comando
+// "hora <0-23>" (tambien acepta el formato "HORA:23"). Si la hora cae en la
+// franja 23h-4h Y los dos LDR ven poca luz, los semaforos pasan a modo
+// intermitente de madrugada: LY1 y LR2 parpadean juntos y el resto se apaga.
+int  horaActualIndicada = -1;            // -1 = todavia nadie dijo la hora
+bool horaNocheProfundaIndicada = false;  // true si esa hora esta en 23h-4h
+
+bool modoNocheProfundaActivo = false;
+bool estadoParpadeoNocheProfunda = false;
+unsigned long tUltimoParpadeoNocheProfunda = 0;
+const unsigned long INTERVALO_PARPADEO_NOCHE = 400;
+
+bool advertenciaHoraMostrada = false;    // no repetir el aviso en cada vuelta
+
+// ============================================================================
+// 10. EMERGENCIA POR CO2 Y LED RGB DE LA PLACA
+// ============================================================================
+// Mientras el CO2 esta por encima de umbralCo2Alto el ciclo normal se congela:
+// se fuerza LG2 + LR1 (evacuacion por la Calle 2) y el LCD muestra el aviso.
+// Al normalizarse, todo vuelve exactamente a como estaba.
+bool emergenciaCO2Activa = false;
+
+// Brillo maximo por canal del LED RGB integrado (0-255): bajo, para no encandilar.
+const uint8_t NIVEL_LED_RGB = 40;
+
+// ============================================================================
 // SETUP
 // ============================================================================
 void setup() {
@@ -304,6 +338,10 @@ void setup() {
     lcd.clear();
   }
 
+#ifdef RGB_BUILTIN
+  rgbLedWrite(RGB_BUILTIN, 0, 0, 0);   // LED RGB de la placa apagado al arrancar
+#endif
+
   tiempoInicioFase = millis();
   duracionVerdeCalculada = verdeMinimo;
   aplicarSemaforos();
@@ -325,9 +363,18 @@ void loop() {
   leerBotones();            // 5. botones fisicos P1 / P2 / combo
   actualizarModoNoche();
   leerCO2();
-  atenderWatchdog();        // 6. red de seguridad: deshace anulaciones vencidas
-  atenderPrioridad();       // 7. emergencia: sostiene el verde de una calle
-  actualizarMaquinaEstados();
+  actualizarLedRGB();       // 6. LED de la placa: verde = aire OK, rojo = critico
+  atenderWatchdog();        // 7. red de seguridad: deshace anulaciones vencidas
+  atenderPrioridad();       // 8. emergencia: sostiene el verde de una calle
+  actualizarEmergenciaCO2();// 9. CO2 critico: congela el ciclo y evacua por C2
+
+  // La emergencia por CO2 manda sobre todo lo demas: mientras dure, ni la
+  // maquina de estados ni el intermitente de madrugada tocan los semaforos.
+  if (!emergenciaCO2Activa) {
+    actualizarMaquinaEstados();
+    actualizarNocheProfunda();
+  }
+
   aplicarSemaforos();       // se aplica cada vuelta: el brillo reacciona al instante
   actualizarLCD();
   imprimirMonitorContinuo();
@@ -519,17 +566,31 @@ void cambiarEstado(EstadoCruce nuevoEstado) {
 //   3. El brillo de dia/noche y el brillo maestro.
 //   4. El parpadeo, que apaga el LED durante media fase.
 //   5. El interlock de seguridad, que corta verdes simultaneos.
+// Los dos modos forzados (emergencia por CO2 y noche profunda) se saltan las
+// capas 1-2 y 4: mandan ellos, por encima de cualquier override de consola.
 void aplicarSemaforos() {
   bool encendido[6] = { false, false, false, false, false, false };
   // indices: 0=LR1 1=LY1 2=LG1 3=LR2 4=LY2 5=LG2
 
-  switch (estadoActual) {
-    case VERDE_CALLE1:    encendido[2] = true; encendido[3] = true; break;
-    case AMARILLO_CALLE1: encendido[1] = true; encendido[3] = true; break;
-    case TODO_ROJO_1a2:   encendido[0] = true; encendido[3] = true; break;
-    case VERDE_CALLE2:    encendido[0] = true; encendido[5] = true; break;
-    case AMARILLO_CALLE2: encendido[0] = true; encendido[4] = true; break;
-    case TODO_ROJO_2a1:   encendido[0] = true; encendido[3] = true; break;
+  bool forzado = emergenciaCO2Activa || modoNocheProfundaActivo;
+
+  if (emergenciaCO2Activa) {
+    // Evacuacion por la Calle 2: su verde y el rojo de la Calle 1.
+    encendido[5] = true;   // LG2
+    encendido[0] = true;   // LR1
+  } else if (modoNocheProfundaActivo) {
+    // Madrugada: solo LY1 y LR2, parpadeando juntos.
+    encendido[1] = estadoParpadeoNocheProfunda;   // LY1
+    encendido[3] = estadoParpadeoNocheProfunda;   // LR2
+  } else {
+    switch (estadoActual) {
+      case VERDE_CALLE1:    encendido[2] = true; encendido[3] = true; break;
+      case AMARILLO_CALLE1: encendido[1] = true; encendido[3] = true; break;
+      case TODO_ROJO_1a2:   encendido[0] = true; encendido[3] = true; break;
+      case VERDE_CALLE2:    encendido[0] = true; encendido[5] = true; break;
+      case AMARILLO_CALLE2: encendido[0] = true; encendido[4] = true; break;
+      case TODO_ROJO_2a1:   encendido[0] = true; encendido[3] = true; break;
+    }
   }
 
   int brilloBase = modoNoche ? brilloNoche : brilloDia;
@@ -538,7 +599,10 @@ void aplicarSemaforos() {
   for (int i = 0; i < 6; i++) {
     int valor;
 
-    if (fadeActivo[i]) {
+    if (forzado) {
+      // Emergencia / madrugada: mandan ellas, sin fade ni override manual.
+      valor = encendido[i] ? brilloBase : 0;
+    } else if (fadeActivo[i]) {
       // --- Capa 2: rampa suave entre dos brillos ---
       unsigned long transcurrido = ahora - fadeInicio[i];
       if (transcurrido >= fadeDuracion[i]) {
@@ -558,8 +622,8 @@ void aplicarSemaforos() {
     // --- Capa 3: brillo maestro (atenuacion global) ---
     valor = (int)(((long)valor * (long)brilloMaestro) / 255L);
 
-    // --- Capa 4: parpadeo ---
-    if (parpadeoPeriodo[i] > 0) {
+    // --- Capa 4: parpadeo (el de consola; los modos forzados traen el suyo) ---
+    if (!forzado && parpadeoPeriodo[i] > 0) {
       if (ahora - parpadeoUltimo[i] >= parpadeoPeriodo[i]) {
         parpadeoUltimo[i] = ahora;
         parpadeoEncendido[i] = !parpadeoEncendido[i];
@@ -585,6 +649,100 @@ void aplicarSemaforos() {
 }
 
 // ============================================================================
+// LED RGB INTEGRADO DE LA PLACA: semaforo de calidad del aire
+//   Verde -> CO2 por debajo del umbral
+//   Rojo  -> CO2 en el umbral o por encima (mismo punto en que dispara la
+//            emergencia), asi se ve el problema sin mirar el LCD.
+// ============================================================================
+void actualizarLedRGB() {
+#ifdef RGB_BUILTIN
+  if (co2Actual >= umbralCo2Alto) {
+    rgbLedWrite(RGB_BUILTIN, NIVEL_LED_RGB, 0, 0);              // rojo
+  } else {
+    rgbLedWrite(RGB_BUILTIN, 0, NIVEL_LED_RGB, 0);              // verde
+  }
+#endif
+}
+
+// ============================================================================
+// EMERGENCIA POR CO2
+// ----------------------------------------------------------------------------
+// Si el CO2 pasa el umbral se congela el ciclo normal, se fuerza LG2+LR1 para
+// evacuar por la Calle 2 y el LCD muestra el aviso de peligro. Cuando el aire
+// se normaliza, el sistema vuelve exactamente al comportamiento anterior.
+// ============================================================================
+void actualizarEmergenciaCO2() {
+  bool nivelPeligroso = (co2Actual >= umbralCo2Alto);
+
+  if (nivelPeligroso && !emergenciaCO2Activa) {
+    emergenciaCO2Activa = true;
+    modoNocheProfundaActivo = false;     // la emergencia manda sobre la madrugada
+    if (lcdPresente) lcd.clear();
+    avisoEvento(F("EMERGENCIA CO2: nivel critico. Evacuacion por la Calle 2."));
+  } else if (!nivelPeligroso && emergenciaCO2Activa) {
+    emergenciaCO2Activa = false;
+    // La fase arranca de cero: no debe "recuperar" el tiempo de la emergencia.
+    tiempoInicioFase = millis();
+    if (lcdPresente) lcd.clear();
+    avisoEvento(F("CO2 normalizado. Reanudando operacion normal."));
+  }
+
+  // Mientras dure, la fase logica es la de evacuacion (LR1 + LG2). Asi el
+  // interlock, la telemetria y el LCD ven un estado coherente.
+  if (emergenciaCO2Activa && estadoActual != VERDE_CALLE2) {
+    estadoActual = VERDE_CALLE2;
+    tiempoInicioFase = millis();
+  }
+}
+
+// ============================================================================
+// NOCHE PROFUNDA (INTERMITENTE DE MADRUGADA)
+// ----------------------------------------------------------------------------
+// Se activa solo si se cumplen las DOS condiciones: la hora indicada por
+// consola cae en 23h-4h Y los dos LDR leen por debajo del umbral de noche.
+// Mientras esta activo, LY1 y LR2 parpadean juntos y el resto queda apagado.
+// Si dijeron la hora pero los sensores no confirman oscuridad, se avisa una
+// sola vez por Serial.
+// ============================================================================
+void actualizarNocheProfunda() {
+  bool ambosLdrBajos = (luz1Actual < umbralNoche) && (luz2Actual < umbralNoche);
+
+  if (horaNocheProfundaIndicada && ambosLdrBajos) {
+    if (!modoNocheProfundaActivo) {
+      modoNocheProfundaActivo = true;
+      estadoParpadeoNocheProfunda = true;
+      tUltimoParpadeoNocheProfunda = millis();
+      avisoEvento(F("NOCHE PROFUNDA: intermitente LY1 + LR2."));
+    }
+    advertenciaHoraMostrada = false;
+
+    unsigned long ahora = millis();
+    if (ahora - tUltimoParpadeoNocheProfunda >= INTERVALO_PARPADEO_NOCHE) {
+      estadoParpadeoNocheProfunda = !estadoParpadeoNocheProfunda;
+      tUltimoParpadeoNocheProfunda = ahora;
+    }
+    return;
+  }
+
+  // --- Condicion no cumplida: se libera el forzado si estaba puesto ---
+  if (modoNocheProfundaActivo) {
+    modoNocheProfundaActivo = false;
+    tiempoInicioFase = millis();
+    avisoEvento(F("Fin de la noche profunda. Ciclo normal reanudado."));
+  }
+
+  // --- Inconsistencia: dijeron la hora pero no hay oscuridad en las dos vias ---
+  if (horaNocheProfundaIndicada && !ambosLdrBajos) {
+    if (!advertenciaHoraMostrada) {
+      avisoEvento(F("ADVERTENCIA: hora en 23h-4h pero los LDR no ven poca luz en ambas vias."));
+      advertenciaHoraMostrada = true;
+    }
+  } else {
+    advertenciaHoraMostrada = false;
+  }
+}
+
+// ============================================================================
 // PANTALLA LCD I2C (16x4) - 4 MODOS
 // ============================================================================
 void actualizarLCD() {
@@ -593,6 +751,9 @@ void actualizarLCD() {
   static unsigned long ultimaActualizacion = 0;
   if (millis() - ultimaActualizacion < 400) return;
   ultimaActualizacion = millis();
+
+  // La emergencia por CO2 tapa cualquier otra pantalla mientras dure.
+  if (emergenciaCO2Activa) { dibujarPantallaEmergenciaCO2(); return; }
 
   // Un mensaje libre (por ejemplo "AMBULANCIA") tapa las pantallas normales
   // mientras este vigente. Sirve para que la maqueta anuncie la emergencia.
@@ -730,6 +891,13 @@ void dibujarPantallaSistema() {
   imprimirFila(1, "CO2 crudo:" + String(co2Actual));
   imprimirFila(2, "Luz1:" + String(luz1Actual) + " Luz2:" + String(luz2Actual));
   imprimirFila(3, nombreFaseLarga() + " " + String(tiempoRestanteFase()) + "s");
+}
+
+void dibujarPantallaEmergenciaCO2() {
+  imprimirFila(0, "!! PELIGRO !!");
+  imprimirFila(1, "CO2 CRITICO");
+  imprimirFila(2, "Valor:" + String(co2Actual));
+  imprimirFila(3, "Evacuando Calle2");
 }
 
 bool haySimulacion() {

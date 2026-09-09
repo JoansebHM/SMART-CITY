@@ -27,7 +27,7 @@
 <main class="grilla">
 
   <!-- ================= VISTA DE LA MAQUETA ================= -->
-  <section class="tarjeta mapa">
+  <section class="tarjeta mapa" id="mapa" data-franja="sinhora">
     <h2>Vista del cruce</h2>
     <svg id="cruce" viewBox="0 0 460 470" role="img" aria-label="Vista superior del cruce">
       <!-- Terreno -->
@@ -120,6 +120,13 @@
       <g class="ambiente" transform="translate(400,420)">
         <circle id="co2Punto" r="10"/><text class="etiqueta" y="28">CO₂</text>
       </g>
+
+      <!-- ---- Reloj digital: la hora que se le indico a la placa ---- -->
+      <g id="reloj" transform="translate(14,14)">
+        <rect class="reloj-caja" width="104" height="44" rx="8"/>
+        <text id="relojHora" class="reloj-hora" x="52" y="26">--:--</text>
+        <text id="relojFranja" class="reloj-franja" x="52" y="38">sin hora</text>
+      </g>
     </svg>
   </section>
 
@@ -162,6 +169,8 @@
         <span id="insigniaNoche" class="insignia">Día</span>
         <span id="insigniaCo2" class="insignia">CO₂ normal</span>
         <span id="insigniaPeaton" class="insignia">Sin peatones</span>
+        <span id="insigniaHora" class="insignia">Sin hora</span>
+        <span id="insigniaNocheProfunda" class="insignia">Ciclo normal</span>
       </div>
     </div>
   </aside>

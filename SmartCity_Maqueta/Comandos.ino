@@ -178,6 +178,9 @@ void procesarComando(String lineaOriginal) {
   if (cmd == "ldr")                                   { cmdLdr(a1, a2); return; }
   if (cmd == "co2")                                   { cmdCo2(a1); return; }
   if (cmd == "noche")                                 { cmdNoche(a1); return; }
+  // Acepta las dos formas: "hora 23" y el formato compacto "HORA:23".
+  if (cmd == "hora")                                  { cmdHora(a1); return; }
+  if (cmd.startsWith("hora:"))                        { cmdHora(cmd.substring(5)); return; }
 
   // ---- peatones ----
   if (cmd == "p1")                                    { pedirPeaton(1); return; }
@@ -620,6 +623,38 @@ void cmdNoche(String valor) {
   avisoError("Uso: noche <on|off|auto>");
 }
 
+// hora <0-23>  -> le dice al sistema que hora es (la placa no tiene reloj).
+// hora off     -> se olvida la hora y no puede haber noche profunda.
+// hora         -> informa la hora que tiene guardada.
+// Si la hora cae en 23h-4h Y los dos LDR ven poca luz, arranca el
+// intermitente de madrugada (LY1 + LR2). Ver actualizarNocheProfunda().
+void cmdHora(String valor) {
+  if (valor.length() == 0) {
+    if (horaActualIndicada < 0) { avisoOk("Sin hora indicada. Uso: hora <0-23>"); return; }
+    avisoOk("Hora indicada: " + String(horaActualIndicada) + "h" +
+            (horaNocheProfundaIndicada ? " (dentro de 23h-4h)" : " (fuera de 23h-4h)"));
+    return;
+  }
+  if (valor == "off" || valor == "auto" || valor == "limpiar") {
+    horaActualIndicada = -1;
+    horaNocheProfundaIndicada = false;
+    advertenciaHoraMostrada = false;
+    avisoOk("Hora olvidada: no habra noche profunda");
+    return;
+  }
+  if (!esNumero(valor)) { avisoError("Uso: hora <0-23>  /  hora off"); return; }
+
+  int hora = valor.toInt();
+  if (hora < 0 || hora > 23) { avisoError("Hora fuera de rango. Usa 0 a 23."); return; }
+
+  horaActualIndicada = hora;
+  horaNocheProfundaIndicada = (hora >= 23 || hora <= 4);
+  advertenciaHoraMostrada = false;
+  avisoOk("Hora recibida: " + String(hora) + "h" +
+          (horaNocheProfundaIndicada ? " (dentro de 23h-4h: madrugada)"
+                                     : " (fuera de ese rango)"));
+}
+
 /* ============================================================================
    CATEGORIA: PEATONES
    ========================================================================= */
@@ -853,6 +888,15 @@ void cmdEscenario(String cual) {
     avisoOk("Escenario: es de dia");
     return;
   }
+  if (cual == "madrugada") {
+    // Las dos condiciones a la vez: hora en 23h-4h y los dos LDR a oscuras.
+    simLdr[0] = 100; simLdr[1] = 100; simNoche = -1;
+    horaActualIndicada = 2;
+    horaNocheProfundaIndicada = true;
+    advertenciaHoraMostrada = false;
+    avisoOk("Escenario: madrugada (2h y oscuro) -> LY1 y LR2 intermitentes");
+    return;
+  }
   if (cual == "contaminacion") {
     simCo2 = umbralCo2Alto + 500;
     for (int i = 0; i < 6; i++) modoCny[i] = CNY_ON;
@@ -881,7 +925,7 @@ void cmdEscenario(String cual) {
     avisoOk("Escenario: hora pico, trafico continuo en ambas calles");
     return;
   }
-  avisoError("Escenarios: trafico1 trafico2 noche dia contaminacion vacio intermitente horapico");
+  avisoError("Escenarios: trafico1 trafico2 noche dia madrugada contaminacion vacio intermitente horapico");
 }
 
 /* ============================================================================
@@ -942,6 +986,10 @@ void resetSimulaciones() {
   botonesFisicosActivos = true;
   solicitudPeaton1 = false;
   solicitudPeaton2 = false;
+  horaActualIndicada = -1;
+  horaNocheProfundaIndicada = false;
+  modoNocheProfundaActivo = false;
+  advertenciaHoraMostrada = false;
   lcdTextoLibre = "";
   if (lcdPresente) lcd.clear();
   for (int i = 0; i < MAX_PROGRAMADOS; i++) programadoActivo[i] = false;
@@ -1070,8 +1118,12 @@ void emitirJson() {
   jsonCampo("co2", co2Actual);
   jsonCampoBool("co2Sim", simCo2 >= 0);
   jsonCampoBool("co2Alto", co2Actual >= umbralCo2Alto);
+  jsonCampoBool("co2Emergencia", emergenciaCO2Activa);
   jsonCampoBool("noche", modoNoche);
   jsonCampo("nocheSim", simNoche);
+  jsonCampo("hora", horaActualIndicada);
+  jsonCampoBool("horaMadrugada", horaNocheProfundaIndicada);
+  jsonCampoBool("nocheProfunda", modoNocheProfundaActivo);
   jsonArreglo("ped", ped, 2);
 
   jsonArreglo("leds", ledActual, 6);
@@ -1142,6 +1194,16 @@ void mostrarEstado() {
   Serial.print(F("Modo noche       : ")); Serial.println(modoNoche ? F("SI") : F("NO"));
   Serial.print(F("CO2              : ")); Serial.print(co2Actual);
   Serial.println(co2Actual >= umbralCo2Alto ? F("  ALTO") : F("  OK"));
+  if (emergenciaCO2Activa) Serial.println(F("EMERGENCIA CO2   : ACTIVA (evacuando por Calle 2)"));
+
+  Serial.print(F("Hora indicada    : "));
+  if (horaActualIndicada < 0) Serial.println(F("ninguna"));
+  else {
+    Serial.print(horaActualIndicada);
+    Serial.println(horaNocheProfundaIndicada ? F("h  (23h-4h)") : F("h"));
+  }
+  Serial.print(F("Noche profunda   : "));
+  Serial.println(modoNocheProfundaActivo ? F("ACTIVA (LY1+LR2 intermitentes)") : F("no"));
 
   Serial.print(F("Brillo maestro   : ")); Serial.println(brilloMaestro);
   Serial.print(F("Interlock seguro : ")); Serial.println(seguroActivo ? F("ON") : F("OFF"));
@@ -1190,7 +1252,8 @@ void mostrarAyuda() {
   Serial.println(F("flujo <c1|c2> <autos/min> | flujo off | ruido <on|off>"));
   Serial.println(F("-- ambiente --"));
   Serial.println(F("ldr <1|2|all> <0-4095|auto> | co2 <valor|alto|bajo|auto>"));
-  Serial.println(F("noche <on|off|auto>"));
+  Serial.println(F("noche <on|off|auto> | hora <0-23|off>  (23h-4h + LDR bajos"));
+  Serial.println(F("                                        = LY1+LR2 intermitentes)"));
   Serial.println(F("-- peatones --"));
   Serial.println(F("p1 | p2 | peaton <c1|c2|limpiar> | botones <on|off>"));
   Serial.println(F("-- pantalla --"));
@@ -1200,8 +1263,8 @@ void mostrarAyuda() {
   Serial.println(F("set <verdemin|verdemax|extension|amarillo|todorojo> <ms>"));
   Serial.println(F("set <umbralnoche|umbralco2|brillodia|brillonoche|cnybajo> <v>"));
   Serial.println(F("-- escenarios --"));
-  Serial.println(F("escenario <trafico1|trafico2|noche|dia|contaminacion|"));
-  Serial.println(F("           vacio|intermitente|horapico>"));
+  Serial.println(F("escenario <trafico1|trafico2|noche|dia|madrugada|"));
+  Serial.println(F("           contaminacion|vacio|intermitente|horapico>"));
   Serial.println(F("-- programacion --"));
   Serial.println(F("en <ms> <comando> | secuencia a ; espera 500 ; b | cancelar"));
   Serial.println(F("-- diagnostico --"));

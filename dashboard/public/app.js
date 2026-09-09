@@ -20,6 +20,7 @@ const GRUPOS = [
       ['Tráfico Calle 2', 'escenario trafico2'],
       ['Noche', 'escenario noche'],
       ['Día', 'escenario dia'],
+      ['Madrugada', 'escenario madrugada'],
       ['Contaminación', 'escenario contaminacion'],
       ['Calle vacía', 'escenario vacio']
     ]
@@ -45,6 +46,17 @@ const GRUPOS = [
       ['CO₂ alto', 'co2 alto'],
       ['CO₂ bajo', 'co2 bajo'],
       ['CO₂ AUTO', 'co2 auto']
+    ]
+  },
+  {
+    // La hora se la decimos nosotros: la placa no tiene reloj. Con la hora en
+    // 23h-4h Y los dos LDR bajos arranca la noche profunda (LY1+LR2).
+    titulo: 'Hora del día',
+    botones: [
+      ['Son las 2:00', 'hora 2'],
+      ['Son las 23:00', 'hora 23'],
+      ['Son las 14:00', 'hora 14'],
+      ['Olvidar hora', 'hora off']
     ]
   },
   {
@@ -197,6 +209,9 @@ function aplicarTelemetria(t) {
   $('#autos1').textContent = t.autos?.[0] ?? 0;
   $('#autos2').textContent = t.autos?.[1] ?? 0;
 
+  // --- Reloj y luz ambiente del mapa ---
+  pintarReloj(t);
+
   // --- Medidores de ambiente ---
   medidor('co2', t.co2 ?? 0, 4095, t.co2Alto);
   medidor('ldr1', t.ldr?.[0] ?? 0, 4095, false);
@@ -207,6 +222,14 @@ function aplicarTelemetria(t) {
   insignia('#insigniaCo2', t.co2Alto, t.co2Alto ? 'CO₂ ALTO' : 'CO₂ normal', 'alerta');
   const hayPeaton = (t.ped?.[0] === 1) || (t.ped?.[1] === 1);
   insignia('#insigniaPeaton', hayPeaton, hayPeaton ? 'Peatón esperando' : 'Sin peatones', 'encendida');
+
+  // Hora indicada por consola (-1 = nadie la ha dicho) y el intermitente de
+  // madrugada, que solo arranca si ademas los dos LDR ven poca luz.
+  const hora = t.hora ?? -1;
+  insignia('#insigniaHora', hora >= 0 && t.horaMadrugada,
+           hora < 0 ? 'Sin hora' : `${hora}:00`, 'encendida');
+  insignia('#insigniaNocheProfunda', !!t.nocheProfunda,
+           t.nocheProfunda ? 'NOCHE PROFUNDA' : 'Ciclo normal', 'alerta');
 
   // --- Aviso de emergencia: lo mas importante de la pantalla cuando pasa ---
   const aviso = $('#avisoPrioridad');
@@ -256,6 +279,51 @@ function medidor(id, valor, maximo, alerta) {
   const relleno = $(`#${id}Barra`);
   relleno.style.width = `${Math.min(100, (valor / maximo) * 100)}%`;
   relleno.classList.toggle('alerta', !!alerta);
+}
+
+/* ---------------------------------------------------------------------------
+   RELOJ DIGITAL Y LUZ DEL MAPA
+   ---------------------------------------------------------------------------
+   La placa no tiene reloj: solo sabe la hora que le dijimos con "hora <0-23>".
+   El panel muestra esa hora y le cuenta los minutos desde que la recibio, pero
+   los deja clavados en :59 para no ensenar nunca una hora distinta de la que
+   cree el firmware (que es la que decide la noche profunda).
+   El tinte del mapa es solo cosmetico: la logica sigue mirando los LDR.
+--------------------------------------------------------------------------- */
+let horaMostrada = -1;
+let horaRecibidaEn = 0;
+
+const NOMBRE_FRANJA = {
+  sinhora: 'sin hora', madrugada: 'madrugada',
+  dia: 'día', atardecer: 'atardecer', noche: 'noche'
+};
+
+function franjaDeHora(h) {
+  if (h < 0) return 'sinhora';
+  if (h >= 23 || h <= 4) return 'madrugada';   // misma franja que la noche profunda
+  if (h <= 17) return 'dia';
+  if (h <= 20) return 'atardecer';
+  return 'noche';
+}
+
+function pintarReloj(t) {
+  const h = t.hora ?? -1;
+  if (h !== horaMostrada) {
+    horaMostrada = h;
+    horaRecibidaEn = Date.now();
+  }
+
+  const franja = franjaDeHora(h);
+  $('#mapa').dataset.franja = franja;
+  $('#relojFranja').textContent = NOMBRE_FRANJA[franja];
+
+  if (h < 0) {
+    $('#relojHora').textContent = '--:--';
+    return;
+  }
+  const minutos = Math.min(59, Math.floor((Date.now() - horaRecibidaEn) / 60000));
+  $('#relojHora').textContent =
+    `${String(h).padStart(2, '0')}:${String(minutos).padStart(2, '0')}`;
 }
 
 function insignia(sel, activa, texto, clase) {

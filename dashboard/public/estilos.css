@@ -124,9 +124,76 @@ h2 {
 
 /* -------------------------------- El cruce -------------------------------- */
 #cruce { width: 100%; height: auto; display: block; border-radius: 8px; }
-.linea-via { stroke: #6b7688; stroke-width: 2.5; stroke-dasharray: 12 12; }
-.cebra rect { fill: #cfd6e2; opacity: .75; }
+.linea-via { stroke: var(--linea-via); stroke-width: 2.5; stroke-dasharray: 12 12; }
+.cebra rect { fill: var(--cebra); opacity: var(--cebra-opacidad); }
 .flecha { fill: #9aa6b8; font-size: 12px; font-weight: 600; text-anchor: middle; }
+
+/* --------- Luz del mapa segun la hora que se le indico a la placa ---------
+   La hora la manda el usuario con "hora <0-23>"; el mapa se tinta para que se
+   note de un vistazo si la ciudad esta de dia o de madrugada. Es solo la piel:
+   la logica del firmware sigue dependiendo de los LDR. */
+:root {
+  --linea-via: #6b7688;
+  --cebra: #cfd6e2;
+  --cebra-opacidad: .75;
+}
+#cruce rect, #cruce line, #cruce circle {
+  transition: fill .9s ease, stroke .9s ease, opacity .9s ease;
+}
+
+.mapa[data-franja="dia"] {
+  --cesped: #24503a;
+  --asfalto: #3b4356;
+  --linea-via: #93a0b4;
+  --cebra-opacidad: .95;
+}
+.mapa[data-franja="atardecer"] {
+  --cesped: #2c3f2a;
+  --asfalto: #3a3542;
+  --linea-via: #8a7f8e;
+  --cebra: #e6d6c4;
+  --cebra-opacidad: .8;
+}
+.mapa[data-franja="noche"] {
+  --cesped: #142a20;
+  --asfalto: #242a38;
+  --linea-via: #5c667a;
+  --cebra-opacidad: .6;
+}
+.mapa[data-franja="madrugada"] {
+  --cesped: #0d1c16;
+  --asfalto: #191e2b;
+  --linea-via: #48505f;
+  --cebra: #aab4c4;
+  --cebra-opacidad: .45;
+}
+
+/* ------------------------------ Reloj digital ----------------------------- */
+.reloj-caja {
+  fill: #0b0f16;
+  stroke: var(--borde);
+  stroke-width: 1.5;
+  opacity: .88;
+}
+.reloj-hora {
+  fill: var(--texto);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-anchor: middle;
+}
+.reloj-franja {
+  fill: var(--texto-tenue);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  text-anchor: middle;
+}
+/* En la franja de madrugada el reloj se pone ambar, como el intermitente */
+.mapa[data-franja="madrugada"] .reloj-hora,
+.mapa[data-franja="madrugada"] .reloj-franja { fill: var(--amarillo); }
 
 .etiqueta {
   fill: var(--texto-tenue);
