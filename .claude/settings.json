@@ -76,7 +76,9 @@
       "Bash(node --input-type=module -e ' *)",
       "Bash(curl -s -m 15 -o /tmp/wta.txt -w \"HTTP %{http_code} | %{time_total}s | redirect: %{redirect_url}\\\\n\" \"http://worldtimeapi.org/api/timezone/America/Bogota\")",
       "Bash(curl -s -m 12 \"http://worldclockapi.com/api/json/utc/now\")",
-      "Bash(perl -pi -e 's/if \\\\\\(lcdPresente\\\\\\) lcd\\\\.clear\\\\\\(\\\\\\);/limpiarLCD\\(\\);/g' SmartCity_Maqueta.ino Comandos.ino)"
+      "Bash(perl -pi -e 's/if \\\\\\(lcdPresente\\\\\\) lcd\\\\.clear\\\\\\(\\\\\\);/limpiarLCD\\(\\);/g' SmartCity_Maqueta.ino Comandos.ino)",
+      "Bash(CLI=\"/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli\" && \"$CLI\" compile --fqbn esp32:esp32:esp32s3 SmartCity_Maqueta 2>&1 | grep -v \"^WARNING: library LiquidCrystal\" | tail -4 && echo && cd dashboard && node verificar-catalogo.js 2>&1 | tail -3 && cd .. && echo && echo \"=== condicion actual de la noche profunda ===\" && grep -n \"void actualizarNocheProfunda\" -A 4 SmartCity_Maqueta/SmartCity_Maqueta.ino)",
+      "Read(//Users/joansebhm/Documents/EAFIT/ISA/**)"
     ],
     "additionalDirectories": [
       "/private/tmp"

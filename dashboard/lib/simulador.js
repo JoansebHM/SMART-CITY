@@ -94,6 +94,7 @@ export class PlacaSimulada extends EventEmitter {
     this.parpNocheUlt = 0;
     this.avisoHora = false;
     this.INTERVALO_PARPADEO_NOCHE = 400;
+    this.MARGEN_SALIDA_NOCHE = 120;   // histeresis, igual que en el firmware
 
     // --- Emergencia por CO2: congela el ciclo y evacua por la Calle 2 ---
     this.emergenciaCO2 = false;
@@ -380,8 +381,15 @@ export class PlacaSimulada extends EventEmitter {
   #atenderNocheProfunda() {
     this.actualizarReloj(); // el reloj avanza solo, igual que en el firmware
 
+    // Los DOS LDR, no uno. Con histeresis igual que el firmware: para entrar
+    // hay que bajar del umbral, para salir hay que subir del umbral + margen,
+    // asi un sensor parado justo en el limite no hace entrar y salir el
+    // intermitente varias veces por segundo.
+    // (Aqui no hace falta el concepto de "lectura valida" del firmware: los
+    // sensores simulados siempre dan un valor bueno.)
     const l = this.ldr;
-    const ambosBajos = l[0] < this.cfg.umbralnoche && l[1] < this.cfg.umbralnoche;
+    const umbral = this.cfg.umbralnoche + (this.nocheProfunda ? this.MARGEN_SALIDA_NOCHE : 0);
+    const ambosBajos = l[0] < umbral && l[1] < umbral;
 
     if (this.horaMadrugada && ambosBajos) {
       if (!this.nocheProfunda) {

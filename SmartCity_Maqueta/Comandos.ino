@@ -1308,6 +1308,14 @@ void mostrarEstado() {
   Serial.print(F("Noche profunda   : "));
   Serial.println(modoNocheProfundaActivo ? F("ACTIVA (LY1+LR2 intermitentes)") : F("no"));
 
+  // Las dos condiciones desglosadas, para no tener que adivinar cual falta
+  Serial.print(F("  cond. hora     : "));
+  Serial.println(horaNocheProfundaIndicada ? F("SI (23h-4h)") : F("no (fuera de 23h-4h)"));
+  Serial.print(F("  cond. oscuridad: "));
+  Serial.println(losDosLdrAOscuras() ? F("SI (los dos LDR)") : F("NO"));
+  Serial.print(F("    "));
+  Serial.println(detalleLdrNocheProfunda());
+
   Serial.print(F("Brillo maestro   : ")); Serial.println(brilloMaestro);
   Serial.print(F("Interlock seguro : ")); Serial.println(seguroActivo ? F("ON") : F("OFF"));
   Serial.print(F("Watchdog         : "));

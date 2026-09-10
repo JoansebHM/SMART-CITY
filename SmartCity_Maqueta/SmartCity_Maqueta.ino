@@ -270,6 +270,17 @@ int co2Actual = 0;
 
 int luz1Actual = 0;
 int luz2Actual = 0;
+
+// ¿La lectura de cada LDR es de fiar? Arrancan en false y no pasan a true
+// hasta que el sensor entrega una lectura creible.
+//
+// Esto importa mucho para la noche profunda: luz1Actual/luz2Actual arrancan en
+// 0, y 0 es "por debajo del umbral", o sea que un sensor del que todavia no
+// sabemos nada se estaba tomando como "tapado". Con un LDR mudo (por el
+// conflicto del ADC2 con el WiFi, o un cable suelto) bastaba con tapar el OTRO
+// para que se cumpliera la condicion de "los dos a oscuras".
+bool luz1Valida = false;
+bool luz2Valida = false;
 bool cnyDetectaEstado[6] = { false, false, false, false, false, false };
 int autosCalle1Actual = 0;
 int autosCalle2Actual = 0;
@@ -554,17 +565,37 @@ void loop() {
 // plausible aqui (el divisor siempre deja algo de tension), asi que lo
 // tratamos como invalido y conservamos el ultimo valor bueno. Si no, el
 // sistema creeria que se hizo de noche de golpe cada vez que se manda un POST.
-void leerADC(int pin, int &destino) {
+// Devuelve true si `destino` quedo con una lectura en la que se puede confiar.
+//
+// El caso ambiguo es el 0 exacto: puede ser oscuridad total de verdad, o puede
+// ser el conflicto del ADC2 con la radio WiFi (o un sensor desconectado). No
+// hay forma de distinguirlos por el valor, asi que se resuelve por contexto:
+//   - Con el WiFi APAGADO no hay conflicto posible, asi que un 0 se acepta
+//     como lectura buena: es oscuridad real.
+//   - Con el WiFi ENCENDIDO un 0 no se toma como valido. Si ya habia un valor
+//     bueno se conserva; si nunca lo hubo, la lectura sigue sin ser de fiar y
+//     quien la use tiene que saberlo (por eso se devuelve el estado).
+bool leerADC(int pin, int &destino, bool &valida) {
   int lectura = analogRead(pin);
-  if (wifiConectado && lectura == 0 && destino != 0) return; // interferencia
+
+  if (wifiConectado && lectura == 0) {
+    return valida;   // no mejora lo que ya sabiamos
+  }
+
   destino = lectura;
+  valida = true;
+  return true;
 }
 
 void leerSensoresDetalle() {
   // Si el valor esta simulado por consola se usa tal cual; el apaño del ADC2
   // solo hace falta cuando se lee el sensor de verdad.
-  if (simLdr[0] >= 0) luz1Actual = simLdr[0]; else leerADC(LDR1, luz1Actual);
-  if (simLdr[1] >= 0) luz2Actual = simLdr[1]; else leerADC(LDR2, luz2Actual);
+  // Un valor simulado siempre es "de fiar": lo puso una persona a proposito.
+  if (simLdr[0] >= 0) { luz1Actual = simLdr[0]; luz1Valida = true; }
+  else                  leerADC(LDR1, luz1Actual, luz1Valida);
+
+  if (simLdr[1] >= 0) { luz2Actual = simLdr[1]; luz2Valida = true; }
+  else                  leerADC(LDR2, luz2Actual, luz2Valida);
 
   for (int i = 0; i < 6; i++) {
     switch (modoCny[i]) {
@@ -590,7 +621,9 @@ bool cnyLeePin(int pin) {
 }
 
 void leerCO2() {
-  if (simCo2 >= 0) co2Actual = simCo2; else leerADC(CO2, co2Actual);
+  static bool co2Valido = false;   // el CO2 no necesita el dato fuera de aqui
+  if (simCo2 >= 0) { co2Actual = simCo2; co2Valido = true; }
+  else               leerADC(CO2, co2Actual, co2Valido);
 }
 
 void actualizarModoNoche() {
@@ -889,8 +922,50 @@ void actualizarEmergenciaCO2() {
 // Si dijeron la hora pero los sensores no confirman oscuridad, se avisa una
 // sola vez por Serial.
 // ============================================================================
+// ¿Un LDR concreto cuenta como "a oscuras"?
+// Exige DOS cosas, y el orden importa:
+//   1. Que su lectura sea de fiar. Un sensor mudo (ADC2 peleando con el WiFi,
+//      cable suelto) se quedaba en 0, y 0 < umbral, o sea que pasaba por
+//      "tapado" sin que nadie lo tapara. Ese era el motivo de que bastara
+//      tapar UN sensor: el otro ya contaba como oscuro por su cuenta.
+//   2. Que este por debajo del umbral, con histeresis: para ENTRAR tiene que
+//      bajar del umbral, pero para SALIR tiene que subir del umbral + margen.
+//      Sin esto, un LDR parado justo en el umbral hace que el intermitente
+//      entre y salga varias veces por segundo.
+const int MARGEN_SALIDA_NOCHE = 120;   // cuentas de ADC de histeresis
+
+bool ldrAOscuras(int valor, bool valida) {
+  if (!valida) return false;   // si no sabemos, NO asumimos que esta oscuro
+  int umbralEfectivo = modoNocheProfundaActivo ? (umbralNoche + MARGEN_SALIDA_NOCHE)
+                                               : umbralNoche;
+  return valor < umbralEfectivo;
+}
+
+// La condicion de la noche profunda: los DOS, no uno.
+bool losDosLdrAOscuras() {
+  return ldrAOscuras(luz1Actual, luz1Valida) && ldrAOscuras(luz2Actual, luz2Valida);
+}
+
+// Explica en una linea el estado de cada LDR frente al umbral. Sirve tanto
+// para el aviso automatico como para el comando "estado".
+String detalleLdrNocheProfunda() {
+  int umbralEfectivo = modoNocheProfundaActivo ? (umbralNoche + MARGEN_SALIDA_NOCHE)
+                                               : umbralNoche;
+  String s = "LDR1=";
+  if (!luz1Valida) s += "SIN LECTURA";
+  else s += String(luz1Actual) + (luz1Actual < umbralEfectivo ? " oscuro" : " CON LUZ");
+
+  s += " | LDR2=";
+  if (!luz2Valida) s += "SIN LECTURA";
+  else s += String(luz2Actual) + (luz2Actual < umbralEfectivo ? " oscuro" : " CON LUZ");
+
+  s += " | umbral=" + String(umbralEfectivo);
+  if (simLdr[0] >= 0 || simLdr[1] >= 0) s += " (SIMULADO)";
+  return s;
+}
+
 void actualizarNocheProfunda() {
-  bool ambosLdrBajos = (luz1Actual < umbralNoche) && (luz2Actual < umbralNoche);
+  bool ambosLdrBajos = losDosLdrAOscuras();
 
   if (horaNocheProfundaIndicada && ambosLdrBajos) {
     if (!modoNocheProfundaActivo) {
@@ -919,7 +994,9 @@ void actualizarNocheProfunda() {
   // --- Inconsistencia: dijeron la hora pero no hay oscuridad en las dos vias ---
   if (horaNocheProfundaIndicada && !ambosLdrBajos) {
     if (!advertenciaHoraMostrada) {
-      avisoEvento(F("ADVERTENCIA: hora en 23h-4h pero los LDR no ven poca luz en ambas vias."));
+      // Decimos exactamente CUAL falta: con el mensaje generico de antes era
+      // imposible saber si el problema era un sensor, el otro, o el umbral.
+      avisoEvento("Hora en 23h-4h pero falta oscuridad: " + detalleLdrNocheProfunda());
       advertenciaHoraMostrada = true;
     }
   } else {
