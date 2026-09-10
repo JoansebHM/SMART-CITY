@@ -168,6 +168,17 @@ const unsigned long TIEMPO_TODO_ROJO   = 1000;
 
 const int UMBRAL_NOCHE = 1000;
 const int BRILLO_DIA   = 255;
+
+// Margen de histeresis del LDR: para pasar a "oscuro" hay que bajar de
+// UMBRAL_NOCHE, pero para volver a "claro" hay que subir de
+// UMBRAL_NOCHE + HISTERESIS_LUZ. Evita que un sensor que quede justo en el
+// umbral este entrando y saliendo de noche todo el rato.
+const int HISTERESIS_LUZ = 150;
+
+// Un LDR tiene que ver oscuro (o claro) de forma continua durante este tiempo
+// antes de que el sistema se lo crea. Filtra sombras momentaneas y lecturas
+// sueltas corrompidas por la radio WiFi.
+const unsigned long CONFIRMACION_LDR_MS = 1500;
 const int UMBRAL_CO2_ALTO = 20500;
 
 const unsigned long DEBOUNCE_MS = 200;
@@ -260,6 +271,20 @@ int co2Actual = 0;
 //     tanto para la logica como para mostrarlo en pantalla ---
 int luz1Actual = 0;
 int luz2Actual = 0;
+
+// --- Estado estable de cada sensor de luz ---
+// La lectura cruda (luzNActual) sirve para mostrarla en pantalla, pero NUNCA
+// se usa directamente para decidir el modo nocturno: primero pasa por este
+// filtro de histeresis + confirmacion por tiempo.
+struct EstadoLdr {
+  bool hayLectura = false;      // false hasta la primera lectura valida del sensor
+  bool oscuro     = false;      // estado confirmado (lo que usa la logica)
+  bool candidato  = false;      // lo que dicen las ultimas lecturas
+  unsigned long tCandidato = 0; // desde cuando el candidato dice lo mismo
+};
+
+EstadoLdr ldr1Estado;
+EstadoLdr ldr2Estado;
 bool cny1Detecta = false, cny2Detecta = false, cny3Detecta = false;
 bool cny4Detecta = false, cny5Detecta = false, cny6Detecta = false;
 int autosCalle1Actual = 0;
@@ -436,8 +461,10 @@ void loop() {
 // tanto la maquina de estados como la pantalla usen los mismos datos)
 // ============================================================================
 void leerSensoresDetalle() {
-  leerADC(LDR1, luz1Actual);
-  leerADC(LDR2, luz2Actual);
+  bool luz1Valida = leerADC(LDR1, luz1Actual);
+  bool luz2Valida = leerADC(LDR2, luz2Actual);
+  actualizarEstadoLdr(ldr1Estado, luz1Actual, luz1Valida);
+  actualizarEstadoLdr(ldr2Estado, luz2Actual, luz2Valida);
 
   cny1Detecta = cnyDetecta(CNY1);
   cny2Detecta = cnyDetecta(CNY2);
@@ -462,12 +489,54 @@ void leerSensoresDetalle() {
 //
 // Si prefieres precision total en vez de este apaño, recablea los 3 sensores a
 // pines del ADC1 (GPIO 1-10); en esta maqueta quedan libres GPIO3 y GPIO10.
-void leerADC(int pin, int &destino) {
+// Devuelve true si la lectura era fiable (y por tanto 'destino' se actualizo).
+//
+// OJO con el 0: antes solo se descartaba si 'destino' ya tenia un valor
+// distinto de 0. Como las variables arrancan en 0, el primer 0 falso que
+// llegaba con el WiFi ya conectado se guardaba, y a partir de ahi la
+// condicion "destino != 0" era siempre falsa: el sensor se quedaba clavado
+// en 0 para siempre, o sea "a oscuras" para siempre. Ahora el 0 se descarta
+// siempre que el WiFi este activo, se haya leido antes o no.
+bool leerADC(int pin, int &destino) {
   int lectura = analogRead(pin);
-  if (wifiConectado && lectura == 0 && destino != 0) {
-    return; // lectura descartada: casi seguro es interferencia del WiFi
+  if (wifiConectado && lectura == 0) {
+    return false; // lectura descartada: casi seguro es interferencia del WiFi
   }
   destino = lectura;
+  return true;
+}
+
+// ============================================================================
+// FILTRO DE LOS SENSORES DE LUZ
+// ============================================================================
+// Convierte la lectura cruda de un LDR en un estado estable claro/oscuro.
+// Dos protecciones: histeresis (para no bailar en el umbral) y confirmacion
+// por tiempo (hay que ver lo mismo durante CONFIRMACION_LDR_MS). Si la lectura
+// no es fiable no se toca nada: un sensor sin dato NUNCA cuenta como oscuro.
+void actualizarEstadoLdr(EstadoLdr &estado, int valor, bool valido) {
+  if (!valido) {
+    estado.candidato = estado.oscuro; // congela el estado hasta tener dato bueno
+    return;
+  }
+  estado.hayLectura = true;
+
+  int umbral = estado.oscuro ? (UMBRAL_NOCHE + HISTERESIS_LUZ) : UMBRAL_NOCHE;
+  bool lecturaOscura = (valor < umbral);
+
+  if (lecturaOscura != estado.candidato) {
+    estado.candidato = lecturaOscura;
+    estado.tCandidato = millis();
+  }
+
+  if (estado.candidato != estado.oscuro &&
+      (millis() - estado.tCandidato) >= CONFIRMACION_LDR_MS) {
+    estado.oscuro = estado.candidato;
+  }
+}
+
+// true solo si el sensor tiene dato fiable Y ese dato confirma oscuridad.
+bool ldrConfirmaOscuridad(const EstadoLdr &estado) {
+  return estado.hayLectura && estado.oscuro;
 }
 
 bool cnyDetecta(int pin) {
@@ -553,9 +622,11 @@ void cambiarModoPantalla() {
 // ============================================================================
 // MODO NOCTURNO
 // ============================================================================
+// Es de noche solo si LOS DOS sensores lo confirman. Antes se usaba el
+// promedio de las dos lecturas, y tapando un solo LDR el promedio ya caia por
+// debajo del umbral: media maqueta a oscuras se leia como noche cerrada.
 void actualizarModoNoche() {
-  int promedioLuz = (luz1Actual + luz2Actual) / 2;
-  modoNoche = (promedioLuz < UMBRAL_NOCHE);
+  modoNoche = ldrConfirmaOscuridad(ldr1Estado) && ldrConfirmaOscuridad(ldr2Estado);
 }
 
 // ============================================================================
@@ -726,10 +797,20 @@ void actualizarLCD() {
 // sincronizada de internet en UTC-5 (o forzada a mano con HORA:<0-23>).
 // ============================================================================
 void actualizarNocheProfunda() {
-  bool ambosLdrBajos = (luz1Actual < UMBRAL_NOCHE) && (luz2Actual < UMBRAL_NOCHE);
+  // Estado ya filtrado de cada sensor: hace falta lectura fiable + oscuridad
+  // sostenida. Tapar un solo LDR deja este AND en false, que es justo lo que
+  // se espera: el parpadeo es para cuando toda la interseccion esta a oscuras.
+  bool ambosLdrBajos = ldrConfirmaOscuridad(ldr1Estado) && ldrConfirmaOscuridad(ldr2Estado);
 
   if (horaNocheProfundaIndicada && ambosLdrBajos) {
     // --- Condición cumplida: activa/mantiene el parpadeo ---
+    if (!modoNocheProfundaActivo) {
+      Serial.print(F("NOCHE PROFUNDA: parpadeo activado (LDR1="));
+      Serial.print(luz1Actual);
+      Serial.print(F(" LDR2="));
+      Serial.print(luz2Actual);
+      Serial.println(F(")"));
+    }
     modoNocheProfundaActivo = true;
     advertenciaHoraMostrada = false;
 
@@ -1425,7 +1506,9 @@ void dibujarPantallaResumen() {
 // --- MODO 2: Detalle sensor por sensor de la Calle 1 ---
 void dibujarPantallaCalle1() {
   imprimirFila(0, "--CALLE 1--   M2");
-  imprimirFila(1, "LDR1:" + String(luz1Actual) + (modoNoche ? " NOC" : " DIA"));
+  // Muestra el estado de ESTE sensor (no el global): asi se ve de un vistazo
+  // cual de los dos LDR esta tapado.
+  imprimirFila(1, "LDR1:" + String(luz1Actual) + (ldrConfirmaOscuridad(ldr1Estado) ? " NOC" : " DIA"));
   imprimirFila(2, "S1:" + String(cny1Detecta ? "C" : "_") +
                    " S2:" + String(cny2Detecta ? "C" : "_") +
                    " S3:" + String(cny3Detecta ? "C" : "_"));
@@ -1435,7 +1518,7 @@ void dibujarPantallaCalle1() {
 // --- MODO 3: Detalle sensor por sensor de la Calle 2 ---
 void dibujarPantallaCalle2() {
   imprimirFila(0, "--CALLE 2--   M3");
-  imprimirFila(1, "LDR2:" + String(luz2Actual) + (modoNoche ? " NOC" : " DIA"));
+  imprimirFila(1, "LDR2:" + String(luz2Actual) + (ldrConfirmaOscuridad(ldr2Estado) ? " NOC" : " DIA"));
   imprimirFila(2, "S4:" + String(cny4Detecta ? "C" : "_") +
                    " S5:" + String(cny5Detecta ? "C" : "_") +
                    " S6:" + String(cny6Detecta ? "C" : "_"));
