@@ -1,197 +1,111 @@
-/* ============================================================================
-   CIUDAD AUTOADAPTABLE (SMART CITY) - MAQUETA CON ESP32
-   ============================================================================
-   Placa: ESP32-S3 (usa GPIO hasta el 42, por eso no es un ESP32 clasico)
+/// Maqueta con ESP32
+#include <Wire.h>              //Library required for I2C comms (LCD)
+#include <LiquidCrystal_I2C.h> 
 
-   DESCRIPCION GENERAL
-   --------------------
-   La maqueta representa un cruce de dos calles perpendiculares:
+#define LDR1 13 // LDR Light sensor from traffic light 1 connected in pin A0
+#define LDR2 12 // LDR Light sensor from traffic light 2 connected in pin A1
+#define CO2 14  // CO2 sensor connected in pin A3
+#define P1 1    // Traffic light 1 button connected in pin 1
+#define P2 2    // Traffic light 2 button connected in pin 2
+#define CNY1 42 // Infrared sensor 1 in traffic light 1 connected in pin 42
+#define CNY2 41 // Infrared sensor 2 in traffic light 1 connected in pin 41
+#define CNY3 40 // Infrared sensor 3 in traffic light 1 connected in pin 40
+#define CNY4 39 // Infrared sensor 4 in traffic light 2 connected in pin 39
+#define CNY5 38 // Infrared sensor 5 in traffic light 2 connected in pin 38
+#define CNY6 37 // Infrared sensor 6 in traffic light 2 connected in pin 37
+#define LR1 5   // Red traffic light 1 connected in pin 5
+#define LY1 4   // Yellow traffic light 1 connected in pin 4
+#define LG1 6   // Green traffic light 1 connected in pin 6
+#define LR2 7   // Red traffic light 2 connected in pin 7
+#define LY2 15  // Yellow traffic light 2 connected in pin 15
+#define LG2 16  // Green traffic light 2 connected in pin 16
 
-     - CALLE 1 (horizontal, arriba en la foto): controlada por el
-       Semaforo 1 (LR1/LY1/LG1). Antes del cruce peatonal hay 3 sensores
-       infrarrojos (CNY1, CNY2, CNY3) que detectan vehiculos (objetos
-       blancos) aproximandose. Junto al semaforo hay un sensor de luz
-       LDR1 y un boton peatonal P1.
+// Library definitions
+LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-     - CALLE 2 (vertical, izquierda en la foto): controlada por el
-       Semaforo 2 (LR2/LY2/LG2), con sus propios sensores CNY4, CNY5,
-       CNY6, su LDR2 y su boton peatonal P2.
+// Tiempos fijos del ciclo semafórico (UC1.12)
+const unsigned long T_VERDE    = 5000; // 10s verde
+const unsigned long T_AMARILLO = 3000;  // 3s amarillo
+const unsigned long T_ROJO_SEG = 1000;  // margen de seguridad (todo en rojo) entre fases
+const unsigned long T_EXTENSION_SEGURIDAD = 2000; 
 
-   Como las dos calles comparten la misma interseccion, NUNCA deben estar
-   ambas en verde al mismo tiempo. El sistema funciona como una maquina
-   de estados que va alternando el verde entre la Calle 1 y la Calle 2,
-   con una fase amarilla y una fase "todo en rojo" de seguridad entre
-   cada cambio (para dar tiempo a que la interseccion quede despejada).
-
-   COMPORTAMIENTO "AUTOADAPTABLE":
-     1. TRAFICO: mientras una calle esta en verde, se cuentan cuantos
-        sensores CNY de ESA calle detectan vehiculos. Si hay cola, el
-        tiempo de verde se alarga (hasta un maximo).
-     2. PEATONES: al pulsar P1 o P2 (uno solo) se marca una "solicitud
-        peatonal" que acorta el verde de los autos de esa calle.
-     3. LUZ AMBIENTE (LDR1/LDR2): de noche se atenuan los LEDs (PWM).
-     4. CALIDAD DE AIRE (CO2): si el CO2 es alto, se reduce el verde
-        maximo para favorecer la rotacion del trafico.
-     5. PANTALLA LCD I2C 16x4: como una sola pantalla no alcanza para
-        mostrar el detalle de los 6 sensores CNY + 2 LDR + CO2 + estado
-        de ambos semaforos, la informacion se reparte en 4 "modos" de
-        pantalla. Para cambiar de pantalla se pulsan P1 y P2 AL MISMO
-        TIEMPO (esto es distinto de pulsarlos por separado, que sigue
-        sirviendo para pedir el cruce peatonal normal). Cada combo
-        avanza una pantalla y al llegar a la ultima vuelve a la primera.
-
-   NOTAS IMPORTANTES DE HARDWARE (leer antes de conectar):
-     - Los pines LDR1(13), LDR2(12) y CO2(14) se leen con analogRead().
-       En muchos ESP32 estos pines pertenecen al ADC2, que NO se puede
-       usar de forma fiable al mismo tiempo que el WiFi esta activo.
-       Este sketch NO usa WiFi, asi que no hay conflicto.
-     - El pin P1 = GPIO1 y P2 = GPIO2. En algunas variantes el pin 1
-       puede coincidir con TX0 de un Serial de depuracion. Si el boton
-       P1 no responde bien, revisa que no este compartido con Serial.
-     - CNY4(39), CNY5(38), CNY6(37): en el ESP32 clasico estos pines
-       son "solo entrada" y no tienen resistencias pull-up/pull-down
-       internas. Si detectas lecturas inestables, agrega una resistencia
-       externa de 10k a 3.3V.
-     - Los sensores CNY detectan objetos blancos/reflectantes. Por
-       defecto este codigo asume que el sensor entrega LOW (0) cuando SI
-       detecta un objeto. Si tu modulo funciona al reves, cambia la
-       constante CNY_ACTIVO_EN_BAJO a false.
-     - Instala la libreria "LiquidCrystal I2C" (autor: Frank de
-       Brabander) desde el Gestor de Librerias de Arduino IDE.
-     - Verifica la direccion I2C de tu pantalla (normalmente 0x27 o
-       0x3F).
-   ========================================================================= */
-
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-
-// ============================================================================
-// 1. DEFINICION DE PINES (tal como estan cableados en la maqueta)
-// ============================================================================
-
-// --- Sensores de luz ambiente (analogicos) ---
-#define LDR1 13   // Sensor de luz semaforo 1
-#define LDR2 12   // Sensor de luz semaforo 2
-
-// --- Sensor de calidad de aire (analogico) ---
-#define CO2  14
-
-// --- Botones peatonales (digitales) ---
-#define P1   1    // Boton peaton calle 1
-#define P2   2    // Boton peaton calle 2
-
-// --- Sensores infrarrojos de vehiculos (digitales) ---
-#define CNY1 42   // Calle 1 - sensor lejano
-#define CNY2 41   // Calle 1 - sensor intermedio
-#define CNY3 40   // Calle 1 - sensor mas cercano al cruce
-#define CNY4 39   // Calle 2 - sensor lejano
-#define CNY5 38   // Calle 2 - sensor intermedio
-#define CNY6 37   // Calle 2 - sensor mas cercano al cruce
-
-// --- Semaforo 1 (calle horizontal) ---
-#define LR1  5    // Rojo
-#define LY1  4    // Amarillo
-#define LG1  6    // Verde
-
-// --- Semaforo 2 (calle vertical) ---
-#define LR2  7    // Rojo
-#define LY2  15   // Amarillo
-#define LG2  16   // Verde
-
-// ============================================================================
-// 2. CONFIGURACION DE LA PANTALLA LCD I2C (16 columnas x 4 filas)
-// ============================================================================
-LiquidCrystal_I2C lcd(0x27, 16, 4);
-
-// ============================================================================
-// 3. PARAMETROS AJUSTABLES DEL SISTEMA
-// ============================================================================
-
-const bool CNY_ACTIVO_EN_BAJO = true;
-
-const unsigned long VERDE_MINIMO       = 5000;
-const unsigned long VERDE_MAXIMO       = 15000;
-const unsigned long EXTENSION_POR_AUTO = 2000;
-const unsigned long TIEMPO_AMARILLO    = 3000;
-const unsigned long TIEMPO_TODO_ROJO   = 1000;
-
-const int UMBRAL_NOCHE = 800;
-const int BRILLO_DIA   = 255;
-const int BRILLO_NOCHE = 60;
-const int UMBRAL_CO2_ALTO = 2500;
-
-const unsigned long DEBOUNCE_MS = 200;
-
-// Ventana de tiempo (ms) dentro de la cual, si P1 y P2 bajan los dos,
-// se considera una pulsacion "combo" en vez de dos pulsaciones sueltas.
-const unsigned long VENTANA_COMBO = 150;
-
-// Cuantas pantallas de informacion existen (ver actualizarLCD)
-const int NUM_MODOS_PANTALLA = 4;
-
-// ============================================================================
-// 4. MAQUINA DE ESTADOS DEL CRUCE
-// ============================================================================
-enum EstadoCruce {
-  VERDE_CALLE1,
-  AMARILLO_CALLE1,
-  TODO_ROJO_1a2,
-  VERDE_CALLE2,
-  AMARILLO_CALLE2,
-  TODO_ROJO_2a1
+// Estados posibles del ciclo (vía 1 y vía 2 son complementarias)
+enum EstadoCiclo {
+  V1_VERDE,
+  V1_AMARILLO,
+  AMBAS_ROJO_1, 
+  V2_VERDE,
+  V2_AMARILLO,
+  AMBAS_ROJO_2 
 };
 
-EstadoCruce estadoActual = VERDE_CALLE1;
-unsigned long tiempoInicioFase = 0;
-unsigned long duracionVerdeCalculada = VERDE_MINIMO;
+EstadoCiclo estadoActual = V1_VERDE;
+unsigned long tEstado = 0; // marca de tiempo en que empezó el estado actual
 
-// ============================================================================
-// 5. VARIABLES DE ESTADO DE ENTRADAS
-// ============================================================================
-bool solicitudPeaton1 = false;
-bool solicitudPeaton2 = false;
+// Variables para el parpadeo de aviso (UC2)
+bool avisoV1Activo = false;
+bool estadoLedAvisoV1 = false;
+unsigned long tUltimoParpadeoV1 = 0;
+const unsigned long INTERVALO_PARPADEO = 300; // ms entre toggles
 
-// --- Variables para distinguir pulsacion individual vs combo ---
-bool p1PendienteConfirmar = false;   // P1 bajo y estamos esperando ver si P2 tambien baja
-bool p2PendienteConfirmar = false;   // P2 bajo y estamos esperando ver si P1 tambien baja
-unsigned long tiempoP1Bajo = 0;      // instante (millis) en que P1 bajo
-unsigned long tiempoP2Bajo = 0;      // instante (millis) en que P2 bajo
-int estadoAnteriorP1 = HIGH;
-int estadoAnteriorP2 = HIGH;
-unsigned long ultimoDebounceP1 = 0;
-unsigned long ultimoDebounceP2 = 0;
-bool comboEnCurso = false;           // evita repetir el cambio de modo mientras se mantienen pulsados
+// Variable para el forzado de LR1 (UC3)
+bool forzadoLR1Activo = false;
 
-bool modoNoche = false;
-int co2Actual = 0;
+// Varaibles (UC4)
+unsigned long extraTiempoRojo1 = 0;
+bool extensionAplicadaRojo1 = false;
 
-// --- Snapshot de sensores, se actualiza cada vuelta del loop y se usa
-//     tanto para la logica como para mostrarlo en pantalla ---
-int luz1Actual = 0;
-int luz2Actual = 0;
-bool cny1Detecta = false, cny2Detecta = false, cny3Detecta = false;
-bool cny4Detecta = false, cny5Detecta = false, cny6Detecta = false;
-int autosCalle1Actual = 0;
-int autosCalle2Actual = 0;
+// Variables para el parpadeo de aviso (UC5)
+bool avisoV2Activo = false;
+bool estadoLedAvisoV2 = false;
+unsigned long tUltimoParpadeoV2 = 0;
 
-// --- Que pantalla de informacion se esta mostrando ahora mismo (0 a 3) ---
-int modoPantalla = 0;
+// Variable para el forzado de LR2 (UC6) 
+bool forzadoLR2Activo = false;
 
-// ============================================================================
-// SETUP
-// ============================================================================
+// Varaibles (UC7)
+unsigned long extraTiempoRojo2 = 0;
+bool extensionAplicadaRojo2 = false;
+
+// Variables para modo nocturno (UC8)
+bool modoNocturnoV1Activo = false;
+bool estadoLedNocturnoV1 = false;
+unsigned long tUltimoParpadeoNocturnoV1 = 0;
+
+// Variables para modo nocturno (UC9)
+bool modoNocturnoV2Activo = false;
+bool estadoLedNocturnoV2 = false;
+unsigned long tUltimoParpadeoNocturnoV2 = 0;
+const int UMBRAL_NOCHE = 100;
+
+// Variables CO2 (UC10)
+const int UMBRAL_CO2_ALTO = 500; // mismo umbral usado en el sketch de nivel medio
+bool alertaCO2Activa = false;
+unsigned long tUltimaImpresionCO2 = 0;
+const unsigned long INTERVALO_IMPRESION_CO2 = 1000;
+
+// Configuración de la fase peatonal fija (UC11/UC12)
+const unsigned long T_PEATON = 5000; // tiempo fijo de rojo forzado al presionar
+
+//Variables de estado para P1 (UC11)
+bool p1Anterior = HIGH;         // INPUT_PULLUP: reposo = HIGH
+bool peatonV1Activo = false;
+unsigned long tInicioPeatonV1 = 0;
+
+// Variables de estado para P2 (UC12)
+bool p2Anterior = HIGH;
+bool peatonV2Activo = false;
+unsigned long tInicioPeatonV2 = 0;
+
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println(F("Iniciando Ciudad Autoadaptable..."));
 
+  // Entradas
   pinMode(LDR1, INPUT);
   pinMode(LDR2, INPUT);
   pinMode(CO2, INPUT);
-
   pinMode(P1, INPUT_PULLUP);
   pinMode(P2, INPUT_PULLUP);
-
   pinMode(CNY1, INPUT);
   pinMode(CNY2, INPUT);
   pinMode(CNY3, INPUT);
@@ -199,6 +113,7 @@ void setup() {
   pinMode(CNY5, INPUT);
   pinMode(CNY6, INPUT);
 
+  // Salidas
   pinMode(LR1, OUTPUT);
   pinMode(LY1, OUTPUT);
   pinMode(LG1, OUTPUT);
@@ -206,383 +121,354 @@ void setup() {
   pinMode(LY2, OUTPUT);
   pinMode(LG2, OUTPUT);
 
-  Wire.begin();
+  tEstado = millis();
+  aplicarEstado(estadoActual);
+
   lcd.init();
   lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("Ciudad Autoadapt."));
-  lcd.setCursor(0, 1);
-  lcd.print(F("Inicializando..."));
-  delay(1500);
-  lcd.clear();
-
-  tiempoInicioFase = millis();
-  duracionVerdeCalculada = VERDE_MINIMO;
-  aplicarSemaforos();
 }
 
-// ============================================================================
-// LOOP PRINCIPAL
-// ============================================================================
 void loop() {
-  leerSensoresDetalle();       // lee LDRs, CNYs y cuenta autos (para logica y pantalla)
-  leerBotones();                // detecta P1, P2 y combos P1+P2
-  actualizarModoNoche();
-  leerCO2();
-  actualizarMaquinaEstados();
-  actualizarLCD();
-
-  delay(50);
+  cicloSemaforoFijo();     // UC1
+  avisoAproximacionV1();   // UC2
+  mantenerRojoV1();        // UC3
+  extensionSeguridadV1();  // UC4
+  avisoAproximacionV2();   // UC5
+  mantenerRojoV2();        // UC6
+  extensionSeguridadV2();  // UC7
+  modoNocturnoV1();        // UC8
+  modoNocturnoV2();        // UC9
+  alertaCalidadAire();     // UC10
+  botonPeatonV1();         // UC11
+  botonPeatonV2();         // UC12
 }
 
-// ============================================================================
-// LECTURA DETALLADA DE SENSORES (se guarda en variables globales para que
-// tanto la maquina de estados como la pantalla usen los mismos datos)
-// ============================================================================
-void leerSensoresDetalle() {
-  luz1Actual = analogRead(LDR1);
-  luz2Actual = analogRead(LDR2);
+// ============================================================
+// UC1 - Ciclo semafórico fijo (base del sistema)
+// Alterna vía 1 y vía 2 en tiempos fijos predefinidos.
+// ============================================================
+void cicloSemaforoFijo() {
+  unsigned long ahora = millis();
+  unsigned long transcurrido = ahora - tEstado;
 
-  cny1Detecta = cnyDetecta(CNY1);
-  cny2Detecta = cnyDetecta(CNY2);
-  cny3Detecta = cnyDetecta(CNY3);
-  cny4Detecta = cnyDetecta(CNY4);
-  cny5Detecta = cnyDetecta(CNY5);
-  cny6Detecta = cnyDetecta(CNY6);
-
-  autosCalle1Actual = (cny1Detecta ? 1 : 0) + (cny2Detecta ? 1 : 0) + (cny3Detecta ? 1 : 0);
-  autosCalle2Actual = (cny4Detecta ? 1 : 0) + (cny5Detecta ? 1 : 0) + (cny6Detecta ? 1 : 0);
-}
-
-bool cnyDetecta(int pin) {
-  int lectura = digitalRead(pin);
-  return CNY_ACTIVO_EN_BAJO ? (lectura == LOW) : (lectura == HIGH);
-}
-
-// ============================================================================
-// LECTURA DE BOTONES: distingue pulsacion individual (peticion peatonal)
-// de pulsacion combinada P1+P2 (cambio de pantalla)
-// ============================================================================
-void leerBotones() {
-  int lecturaP1 = digitalRead(P1);
-  int lecturaP2 = digitalRead(P2);
-
-  // --- Deteccion de flancos de bajada (HIGH -> LOW) de cada boton ---
-  if (lecturaP1 == LOW && estadoAnteriorP1 == HIGH &&
-      (millis() - ultimoDebounceP1) > DEBOUNCE_MS) {
-    p1PendienteConfirmar = true;
-    tiempoP1Bajo = millis();
-    ultimoDebounceP1 = millis();
+  switch (estadoActual) {
+    case V1_VERDE:
+      if (transcurrido >= T_VERDE) cambiarEstado(V1_AMARILLO);
+      break;
+    case V1_AMARILLO:
+      if (transcurrido >= T_AMARILLO) cambiarEstado(AMBAS_ROJO_1);
+      break;
+    case AMBAS_ROJO_1:
+      if (transcurrido >= T_ROJO_SEG + extraTiempoRojo1) cambiarEstado(V2_VERDE);
+      break;
+    case V2_VERDE:
+      if (transcurrido >= T_VERDE) cambiarEstado(V2_AMARILLO);
+      break;
+    case V2_AMARILLO:
+      if (transcurrido >= T_AMARILLO) cambiarEstado(AMBAS_ROJO_2);
+      break;
+    case AMBAS_ROJO_2:
+      if (transcurrido >= T_ROJO_SEG + extraTiempoRojo2) cambiarEstado(V1_VERDE);
+      break;
   }
-  estadoAnteriorP1 = lecturaP1;
+}
 
-  if (lecturaP2 == LOW && estadoAnteriorP2 == HIGH &&
-      (millis() - ultimoDebounceP2) > DEBOUNCE_MS) {
-    p2PendienteConfirmar = true;
-    tiempoP2Bajo = millis();
-    ultimoDebounceP2 = millis();
-  }
-  estadoAnteriorP2 = lecturaP2;
+// ============================================================
+// UC2 - CNY1 detecta objeto aproximándose -> aviso parpadeante en LY1
+// Acción fija: mientras haya detección, LY1 parpadea.
+// Solo actúa si el semáforo está en V1_VERDE, para no pisar
+// el estado real de amarillo del ciclo (UC1).
+// ============================================================
+void avisoAproximacionV1() {
+  bool objetoDetectado = digitalRead(CNY1) == LOW; // <-- CNY activo en bajo
 
-  // --- Si los dos botones estan pendientes y bajaron dentro de la
-  //     ventana de combo, es una pulsacion conjunta: cambiar pantalla ---
-  if (p1PendienteConfirmar && p2PendienteConfirmar) {
-    unsigned long diferencia = (tiempoP1Bajo > tiempoP2Bajo)
-                                  ? (tiempoP1Bajo - tiempoP2Bajo)
-                                  : (tiempoP2Bajo - tiempoP1Bajo);
-    if (diferencia <= VENTANA_COMBO) {
-      cambiarModoPantalla();
-      p1PendienteConfirmar = false;
-      p2PendienteConfirmar = false;
+  if (objetoDetectado && estadoActual == V1_VERDE) {
+    unsigned long ahora = millis();
+    if (ahora - tUltimoParpadeoV1 >= INTERVALO_PARPADEO) {
+      estadoLedAvisoV1 = !estadoLedAvisoV1;
+      digitalWrite(LY1, estadoLedAvisoV1 ? HIGH : LOW);
+      tUltimoParpadeoV1 = ahora;
+    }
+    avisoV1Activo = true;
+  } else if (avisoV1Activo) {
+    avisoV1Activo = false;
+    if (estadoActual == V1_VERDE) {
+      digitalWrite(LY1, LOW);
     }
   }
+}
 
-  // --- Si paso la ventana de combo y solo uno de los dos bajo,
-  //     se confirma como pulsacion individual (peticion peatonal) ---
-  if (p1PendienteConfirmar && (millis() - tiempoP1Bajo) > VENTANA_COMBO) {
-    if (!p2PendienteConfirmar) {
-      solicitudPeaton1 = true;
-      Serial.println(F("Peaton solicito cruce en Calle 1"));
+// ============================================================
+// UC3 - CNY2 detecta objeto a media distancia en vía 1
+// Acción fija: mientras haya detección, fuerza LR1 encendido
+// (sobrescribe LY1/LG1 sin importar la fase del ciclo).
+// No altera los tiempos del ciclo (UC1) ni el estado interno,
+// solo sobrescribe la salida física mientras dura la detección.
+// ============================================================
+void mantenerRojoV1() {
+  bool objetoDetectado = digitalRead(CNY2) == LOW; // activo en bajo, igual que CNY1
+
+  if (objetoDetectado) {
+    digitalWrite(LG1, LOW);
+    digitalWrite(LY1, LOW);
+    digitalWrite(LR1, HIGH);
+    forzadoLR1Activo = true;
+  } else if (forzadoLR1Activo) {
+    forzadoLR1Activo = false;
+    aplicarEstado(estadoActual);
+  }
+}
+
+// ============================================================
+// UC4 - CNY3 detecta vehículo en el cruce durante la transición
+// de seguridad (AMBAS_ROJO_1) -> extiende ese rojo +2s fijos, una sola vez.
+// Acción fija: siempre la misma extensión, sin importar cuántos
+// vehículos o cuánto tiempo lleve detectando.
+// ============================================================
+void extensionSeguridadV1() {
+  bool objetoEnCruce = digitalRead(CNY3) == LOW; // activo en bajo
+
+  if (estadoActual == AMBAS_ROJO_1 && objetoEnCruce && !extensionAplicadaRojo1) {
+    extraTiempoRojo1 += T_EXTENSION_SEGURIDAD;
+    extensionAplicadaRojo1 = true;
+    Serial.println(">> CNY3 detectó en el cruce -> extendiendo +2s (t=" + String(millis()) + ")");
+  }
+}
+
+// ============================================================
+// UC5 - CNY4 detecta objeto aproximándose en vía 2 -> aviso parpadeante en LY2
+// Acción fija: mientras haya detección, LY2 parpadea.
+// Solo actúa si el semáforo está en V2_VERDE.
+// ============================================================
+void avisoAproximacionV2() {
+  bool objetoDetectado = digitalRead(CNY4) == LOW; // activo en bajo
+
+  if (objetoDetectado && estadoActual == V2_VERDE) {
+    unsigned long ahora = millis();
+    if (ahora - tUltimoParpadeoV2 >= INTERVALO_PARPADEO) {
+      estadoLedAvisoV2 = !estadoLedAvisoV2;
+      digitalWrite(LY2, estadoLedAvisoV2 ? HIGH : LOW);
+      tUltimoParpadeoV2 = ahora;
     }
-    p1PendienteConfirmar = false;
-  }
-
-  if (p2PendienteConfirmar && (millis() - tiempoP2Bajo) > VENTANA_COMBO) {
-    if (!p1PendienteConfirmar) {
-      solicitudPeaton2 = true;
-      Serial.println(F("Peaton solicito cruce en Calle 2"));
+    avisoV2Activo = true;
+  } else if (avisoV2Activo) {
+    avisoV2Activo = false;
+    if (estadoActual == V2_VERDE) {
+      digitalWrite(LY2, LOW);
     }
-    p2PendienteConfirmar = false;
-  }
-
-  // --- Evita que, si se mantienen los dos botones apretados, la
-  //     pantalla siga avanzando modo tras modo sin soltar ---
-  if (lecturaP1 == LOW && lecturaP2 == LOW) {
-    comboEnCurso = true;
-  } else {
-    comboEnCurso = false;
   }
 }
 
-// Avanza a la siguiente pantalla de informacion (ciclico: 0,1,2,3,0,1...)
-void cambiarModoPantalla() {
-  modoPantalla = (modoPantalla + 1) % NUM_MODOS_PANTALLA;
-  lcd.clear(); // limpieza total al cambiar de pantalla para no dejar residuos
-  Serial.print(F("Cambio a pantalla: "));
-  Serial.println(modoPantalla + 1);
+// ============================================================
+// UC6 - CNY5 detecta objeto a media distancia en vía 2
+// Acción fija: mientras haya detección, fuerza
+// LR2 encendido (sobrescribe LY2/LG2 sin importar la fase del ciclo).
+// ============================================================
+void mantenerRojoV2() {
+  bool objetoDetectado = digitalRead(CNY5) == LOW; // activo en bajo
+
+  if (objetoDetectado) {
+    digitalWrite(LG2, LOW);
+    digitalWrite(LY2, LOW);
+    digitalWrite(LR2, HIGH);
+    forzadoLR2Activo = true;
+  } else if (forzadoLR2Activo) {
+    forzadoLR2Activo = false;
+    aplicarEstado(estadoActual);
+  }
 }
 
-// ============================================================================
-// MODO NOCTURNO
-// ============================================================================
-void actualizarModoNoche() {
-  int promedioLuz = (luz1Actual + luz2Actual) / 2;
-  modoNoche = (promedioLuz < UMBRAL_NOCHE);
+// ============================================================
+// UC7 - CNY6 detecta vehículo en el cruce durante la transición
+// de seguridad (AMBAS_ROJO_2) -> extiende ese rojo +2s fijos, una sola vez.
+// ============================================================
+void extensionSeguridadV2() {
+  bool objetoEnCruce = digitalRead(CNY6) == LOW; // activo en bajo
+
+  if (estadoActual == AMBAS_ROJO_2 && objetoEnCruce && !extensionAplicadaRojo2) {
+    extraTiempoRojo2 += T_EXTENSION_SEGURIDAD;
+    extensionAplicadaRojo2 = true;
+  }
 }
 
-// ============================================================================
-// LECTURA DEL SENSOR DE CO2
-// ============================================================================
-void leerCO2() {
-  co2Actual = analogRead(CO2);
-  // NOTA: valor crudo de ADC (0-4095). Para ppm reales se necesita la
-  // curva de calibracion propia del sensor (ej. MQ-135).
+void cambiarEstado(EstadoCiclo nuevo) {
+  estadoActual = nuevo;
+  tEstado = millis();
+  aplicarEstado(nuevo);
+
+  if (nuevo == AMBAS_ROJO_1) {
+    extraTiempoRojo1 = 0;
+    extensionAplicadaRojo1 = false;
+  }
+
+  if (nuevo == AMBAS_ROJO_2) {
+    extraTiempoRojo2 = 0;
+    extensionAplicadaRojo2 = false;
+  }
 }
 
-// ============================================================================
-// MAQUINA DE ESTADOS DEL CRUCE
-// ============================================================================
-void actualizarMaquinaEstados() {
-  unsigned long transcurrido = millis() - tiempoInicioFase;
+// ============================================================
+// UC8 - LDR1 detecta poca luz ambiente -> LY1 parpadeo intermitente
+// (modo nocturno). Acción fija por umbral: mientras la luz esté baja,
+// el semáforo 1 se comporta como amarillo intermitente, sobrescribiendo
+// el ciclo normal (UC1) sin importar en qué fase esté.
+// ============================================================
+void modoNocturnoV1() {
+  bool pocaLuz = analogRead(LDR1) < UMBRAL_NOCHE;
+  if (pocaLuz) {
+    digitalWrite(LR1, LOW);
+    digitalWrite(LG1, LOW);
 
-  switch (estadoActual) {
-
-    case VERDE_CALLE1: {
-      unsigned long limiteVerde = duracionVerdeCalculada;
-      if (solicitudPeaton1 && limiteVerde > VERDE_MINIMO) {
-        limiteVerde = VERDE_MINIMO;
-      }
-      if (transcurrido >= limiteVerde) {
-        cambiarEstado(AMARILLO_CALLE1);
-      }
-      break;
+    unsigned long ahora = millis();
+    if (ahora - tUltimoParpadeoNocturnoV1 >= INTERVALO_PARPADEO) {
+      estadoLedNocturnoV1 = !estadoLedNocturnoV1;
+      digitalWrite(LY1, estadoLedNocturnoV1 ? HIGH : LOW);
+      tUltimoParpadeoNocturnoV1 = ahora;
     }
+    modoNocturnoV1Activo = true;
+  } else if (modoNocturnoV1Activo) {
+    modoNocturnoV1Activo = false;
+    aplicarEstado(estadoActual);
+  }
+}
 
-    case AMARILLO_CALLE1:
-      if (transcurrido >= TIEMPO_AMARILLO) {
-        cambiarEstado(TODO_ROJO_1a2);
-      }
-      break;
+// ============================================================
+// UC9- LDR2 detecta poca luz ambiente -> LY2 parpadeo intermitente
+// ============================================================
+void modoNocturnoV2() {
+  bool pocaLuz = analogRead(LDR2) < UMBRAL_NOCHE;
+ 
+  if (pocaLuz) {
+    digitalWrite(LR2, LOW);
+    digitalWrite(LG2, LOW);
 
-    case TODO_ROJO_1a2:
-      if (transcurrido >= TIEMPO_TODO_ROJO) {
-        if (solicitudPeaton1) solicitudPeaton1 = false;
-        duracionVerdeCalculada = calcularDuracionVerde(autosCalle2Actual);
-        cambiarEstado(VERDE_CALLE2);
-      }
-      break;
-
-    case VERDE_CALLE2: {
-      unsigned long limiteVerde = duracionVerdeCalculada;
-      if (solicitudPeaton2 && limiteVerde > VERDE_MINIMO) {
-        limiteVerde = VERDE_MINIMO;
-      }
-      if (transcurrido >= limiteVerde) {
-        cambiarEstado(AMARILLO_CALLE2);
-      }
-      break;
+    unsigned long ahora = millis();
+    if (ahora - tUltimoParpadeoNocturnoV2 >= INTERVALO_PARPADEO) {
+      estadoLedNocturnoV2 = !estadoLedNocturnoV2;
+      digitalWrite(LY2, estadoLedNocturnoV2 ? HIGH : LOW);
+      tUltimoParpadeoNocturnoV2 = ahora;
     }
+    modoNocturnoV2Activo = true;
+  } else if (modoNocturnoV2Activo) {
+    modoNocturnoV2Activo = false;
+    aplicarEstado(estadoActual);
+  }
+}
 
-    case AMARILLO_CALLE2:
-      if (transcurrido >= TIEMPO_AMARILLO) {
-        cambiarEstado(TODO_ROJO_2a1);
-      }
+// ============================================================
+// UC10 - CO2 por encima de un umbral fijo (en ppm) -> Display
+// muestra "Aire contaminado". Comparación instantánea, sin tendencia.
+// ============================================================
+void alertaCalidadAire() {
+  unsigned long ahora = millis();
+  if (ahora - tUltimaImpresionCO2 < INTERVALO_IMPRESION_CO2) return;
+  tUltimaImpresionCO2 = ahora;
+  
+  int lecturaCO2 = analogRead(CO2);
+  Serial.println(lecturaCO2); // 0-4095, sin calibrar a ppm
+  bool aireContaminado = lecturaCO2 > UMBRAL_CO2_ALTO;
+
+  // --- Línea 1: monitoreo permanente, se actualiza siempre ---
+  lcd.setCursor(0, 0);
+  lcd.print("CO2: ");
+  lcd.print(lecturaCO2);
+  lcd.print("    "); // espacios para borrar digitos sobrantes de una lectura anterior mas larga
+
+  // --- Línea 2: alerta con el numero, solo cuando supera el umbral ---
+  if (aireContaminado) {
+    lcd.setCursor(0, 1);
+    lcd.print("ALERTA! CO2:");
+    lcd.print(lecturaCO2);
+    lcd.print("   ");
+    alertaCO2Activa = true;
+  } else if (alertaCO2Activa) {
+    lcd.setCursor(0, 1);
+    lcd.print("                "); // 16 espacios: borra la linea de alerta
+    alertaCO2Activa = false;
+  }
+}
+
+// ============================================================
+// UC11 - P1 presionado -> fuerza LR1 por un tiempo fijo (paso peatonal)
+// Acción fija: siempre la misma duración, sin encolar ni esperar
+// un momento "óptimo" del ciclo (eso sería nivel medio).
+// Detecta flanco de bajada (botón con INPUT_PULLUP: reposo=HIGH, presionado=LOW).
+// ============================================================
+void botonPeatonV1() {
+  bool p1Actual = digitalRead(P1);
+
+  // Flanco de bajada: se acaba de presionar
+  if (p1Anterior == HIGH && p1Actual == LOW && !peatonV1Activo) {
+    peatonV1Activo = true;
+    tInicioPeatonV1 = millis();
+  }
+  p1Anterior = p1Actual;
+
+  if (peatonV1Activo) {
+    digitalWrite(LG1, LOW);
+    digitalWrite(LY1, LOW);
+    digitalWrite(LR1, HIGH);
+
+    if (millis() - tInicioPeatonV1 >= T_PEATON) {
+      peatonV1Activo = false;
+      aplicarEstado(estadoActual); // libera y vuelve al ciclo real
+    }
+  }
+}
+
+// ============================================================
+// UC12 - P2 presionado -> fuerza LR2 por un tiempo fijo
+// ============================================================
+void botonPeatonV2() {
+  bool p2Actual = digitalRead(P2);
+
+  if (p2Anterior == HIGH && p2Actual == LOW && !peatonV2Activo) {
+    peatonV2Activo = true;
+    tInicioPeatonV2 = millis();
+  }
+  p2Anterior = p2Actual;
+
+  if (peatonV2Activo) {
+    digitalWrite(LG2, LOW);
+    digitalWrite(LY2, LOW);
+    digitalWrite(LR2, HIGH);
+
+    if (millis() - tInicioPeatonV2 >= T_PEATON) {
+      peatonV2Activo = false;
+      aplicarEstado(estadoActual);
+    }
+  }
+}
+
+void aplicarEstado(EstadoCiclo e) {
+  // Apaga todo primero para evitar solapes
+  digitalWrite(LR1, LOW); digitalWrite(LY1, LOW); digitalWrite(LG1, LOW);
+  digitalWrite(LR2, LOW); digitalWrite(LY2, LOW); digitalWrite(LG2, LOW);
+
+  switch (e) {
+    case V1_VERDE:
+      digitalWrite(LG1, HIGH);
+      digitalWrite(LR2, HIGH);
       break;
-
-    case TODO_ROJO_2a1:
-      if (transcurrido >= TIEMPO_TODO_ROJO) {
-        if (solicitudPeaton2) solicitudPeaton2 = false;
-        duracionVerdeCalculada = calcularDuracionVerde(autosCalle1Actual);
-        cambiarEstado(VERDE_CALLE1);
-      }
+    case V1_AMARILLO:
+      digitalWrite(LY1, HIGH);
+      digitalWrite(LR2, HIGH);
+      break;
+    case AMBAS_ROJO_1:
+      digitalWrite(LR1, HIGH);
+      digitalWrite(LR2, HIGH);
+      break;
+    case V2_VERDE:
+      digitalWrite(LG2, HIGH);
+      digitalWrite(LR1, HIGH);
+      break;
+    case V2_AMARILLO:
+      digitalWrite(LY2, HIGH);
+      digitalWrite(LR1, HIGH);
+      break;
+    case AMBAS_ROJO_2:
+      digitalWrite(LR1, HIGH);
+      digitalWrite(LR2, HIGH);
       break;
   }
-}
-
-unsigned long calcularDuracionVerde(int autosDetectados) {
-  unsigned long duracion = VERDE_MINIMO + (autosDetectados * EXTENSION_POR_AUTO);
-
-  unsigned long maximoPermitido = VERDE_MAXIMO;
-  if (co2Actual >= UMBRAL_CO2_ALTO) {
-    maximoPermitido = VERDE_MINIMO + (EXTENSION_POR_AUTO * 2);
-  }
-
-  if (duracion > maximoPermitido) duracion = maximoPermitido;
-  if (duracion < VERDE_MINIMO) duracion = VERDE_MINIMO;
-  return duracion;
-}
-
-void cambiarEstado(EstadoCruce nuevoEstado) {
-  estadoActual = nuevoEstado;
-  tiempoInicioFase = millis();
-  aplicarSemaforos();
-}
-
-// ============================================================================
-// APLICA EL ESTADO ACTUAL A LOS LEDS FISICOS
-// ============================================================================
-void aplicarSemaforos() {
-  escribirLuz(LR1, false); escribirLuz(LY1, false); escribirLuz(LG1, false);
-  escribirLuz(LR2, false); escribirLuz(LY2, false); escribirLuz(LG2, false);
-
-  switch (estadoActual) {
-    case VERDE_CALLE1:
-      escribirLuz(LG1, true);
-      escribirLuz(LR2, true);
-      break;
-    case AMARILLO_CALLE1:
-      escribirLuz(LY1, true);
-      escribirLuz(LR2, true);
-      break;
-    case TODO_ROJO_1a2:
-      escribirLuz(LR1, true);
-      escribirLuz(LR2, true);
-      break;
-    case VERDE_CALLE2:
-      escribirLuz(LR1, true);
-      escribirLuz(LG2, true);
-      break;
-    case AMARILLO_CALLE2:
-      escribirLuz(LR1, true);
-      escribirLuz(LY2, true);
-      break;
-    case TODO_ROJO_2a1:
-      escribirLuz(LR1, true);
-      escribirLuz(LR2, true);
-      break;
-  }
-}
-
-void escribirLuz(int pin, bool encendido) {
-  if (!encendido) {
-    analogWrite(pin, 0);
-    return;
-  }
-  int brillo = modoNoche ? BRILLO_NOCHE : BRILLO_DIA;
-  analogWrite(pin, brillo);
-}
-
-// ============================================================================
-// PANTALLA LCD I2C (16x4) - 4 MODOS DE VISUALIZACION
-// ============================================================================
-// Se cambia de modo pulsando P1+P2 al mismo tiempo (ver leerBotones/
-// cambiarModoPantalla). Cada modo llama a su propia funcion de dibujo.
-void actualizarLCD() {
-  static unsigned long ultimaActualizacion = 0;
-  if (millis() - ultimaActualizacion < 500) return;
-  ultimaActualizacion = millis();
-
-  switch (modoPantalla) {
-    case 0: dibujarPantallaResumen();   break;
-    case 1: dibujarPantallaCalle1();    break;
-    case 2: dibujarPantallaCalle2();    break;
-    case 3: dibujarPantallaSistema();   break;
-  }
-}
-
-// Escribe una fila completa, limpiandola primero para que nunca queden
-// caracteres residuales de un texto mas largo mostrado antes.
-void imprimirFila(int fila, String texto) {
-  lcd.setCursor(0, fila);
-  lcd.print(F("                ")); // 16 espacios: borra la fila
-  lcd.setCursor(0, fila);
-  if (texto.length() > 16) texto = texto.substring(0, 16);
-  lcd.print(texto);
-}
-
-unsigned long duracionActualDeFase() {
-  switch (estadoActual) {
-    case VERDE_CALLE1:
-    case VERDE_CALLE2:
-      return duracionVerdeCalculada;
-    case AMARILLO_CALLE1:
-    case AMARILLO_CALLE2:
-      return TIEMPO_AMARILLO;
-    case TODO_ROJO_1a2:
-    case TODO_ROJO_2a1:
-      return TIEMPO_TODO_ROJO;
-  }
-  return VERDE_MINIMO;
-}
-
-long tiempoRestanteFase() {
-  unsigned long transcurrido = millis() - tiempoInicioFase;
-  long restante = (long)duracionActualDeFase() - (long)transcurrido;
-  if (restante < 0) restante = 0;
-  return restante / 1000;
-}
-
-String faseCortaCalle1() {
-  switch (estadoActual) {
-    case VERDE_CALLE1:    return "VER";
-    case AMARILLO_CALLE1: return "AMA";
-    default:              return "ROJ";
-  }
-}
-
-String faseCortaCalle2() {
-  switch (estadoActual) {
-    case VERDE_CALLE2:    return "VER";
-    case AMARILLO_CALLE2: return "AMA";
-    default:              return "ROJ";
-  }
-}
-
-String nombreFaseLarga() {
-  switch (estadoActual) {
-    case VERDE_CALLE1:    return "Verde C1";
-    case AMARILLO_CALLE1: return "Amar. C1";
-    case TODO_ROJO_1a2:   return "Rojo 1>2";
-    case VERDE_CALLE2:    return "Verde C2";
-    case AMARILLO_CALLE2: return "Amar. C2";
-    case TODO_ROJO_2a1:   return "Rojo 2>1";
-  }
-  return "";
-}
-
-// --- MODO 1: Resumen general de todo el cruce ---
-void dibujarPantallaResumen() {
-  imprimirFila(0, "C1:" + faseCortaCalle1() + " C2:" + faseCortaCalle2() + "   M1");
-  imprimirFila(1, "Resta:" + String(tiempoRestanteFase()) + "s CO2:" + (co2Actual >= UMBRAL_CO2_ALTO ? "ALTO" : "OK"));
-  imprimirFila(2, "Autos C1:" + String(autosCalle1Actual) + " C2:" + String(autosCalle2Actual));
-  imprimirFila(3, "Noche:" + String(modoNoche ? "SI" : "NO") + " Ped:" + String((solicitudPeaton1 || solicitudPeaton2) ? "SI" : "NO"));
-}
-
-// --- MODO 2: Detalle sensor por sensor de la Calle 1 ---
-void dibujarPantallaCalle1() {
-  imprimirFila(0, "--CALLE 1--   M2");
-  imprimirFila(1, "LDR1:" + String(luz1Actual) + (modoNoche ? " NOC" : " DIA"));
-  imprimirFila(2, "S1:" + String(cny1Detecta ? "C" : "_") +
-                   " S2:" + String(cny2Detecta ? "C" : "_") +
-                   " S3:" + String(cny3Detecta ? "C" : "_"));
-  imprimirFila(3, "Autos:" + String(autosCalle1Actual) + " Bot:" + String(solicitudPeaton1 ? "SI" : "NO"));
-}
-
-// --- MODO 3: Detalle sensor por sensor de la Calle 2 ---
-void dibujarPantallaCalle2() {
-  imprimirFila(0, "--CALLE 2--   M3");
-  imprimirFila(1, "LDR2:" + String(luz2Actual) + (modoNoche ? " NOC" : " DIA"));
-  imprimirFila(2, "S4:" + String(cny4Detecta ? "C" : "_") +
-                   " S5:" + String(cny5Detecta ? "C" : "_") +
-                   " S6:" + String(cny6Detecta ? "C" : "_"));
-  imprimirFila(3, "Autos:" + String(autosCalle2Actual) + " Bot:" + String(solicitudPeaton2 ? "SI" : "NO"));
-}
-
-// --- MODO 4: Estado general del sistema / ambiente ---
-void dibujarPantallaSistema() {
-  imprimirFila(0, "--SISTEMA--   M4");
-  imprimirFila(1, "CO2 crudo:" + String(co2Actual));
-  imprimirFila(2, "Luz1:" + String(luz1Actual) + " Luz2:" + String(luz2Actual));
-  imprimirFila(3, nombreFaseLarga() + " " + String(tiempoRestanteFase()) + "s");
 }
