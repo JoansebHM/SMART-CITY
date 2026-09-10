@@ -39,12 +39,28 @@
         TIEMPO (esto es distinto de pulsarlos por separado, que sigue
         sirviendo para pedir el cruce peatonal normal). Cada combo
         avanza una pantalla y al llegar a la ultima vuelve a la primera.
+     6. RELOJ POR INTERNET: al arrancar, la maqueta se conecta al WiFi
+        y pide la hora actual en zona UTC-5 (America/Bogota) a una API
+        de tiempo. Esa hora queda seteada en el reloj interno, que
+        sigue avanzando solo con millis(), y se muestra en el tablero
+        digital (LCD). Como el modo "noche profunda" depende de la
+        franja 23h-4h, ya no hace falta indicarla a mano por Serial:
+        se calcula sola a partir del reloj sincronizado.
+     7. TELEMETRIA: cada 5 segundos se envia un POST con el numero de
+        vehiculos detectados en cada calle al servidor de pruebas
+        (requestcatcher).
 
    NOTAS IMPORTANTES DE HARDWARE (leer antes de conectar):
      - Los pines LDR1(13), LDR2(12) y CO2(14) se leen con analogRead().
-       En muchos ESP32 estos pines pertenecen al ADC2, que NO se puede
-       usar de forma fiable al mismo tiempo que el WiFi esta activo.
-       Este sketch NO usa WiFi, asi que no hay conflicto.
+       En el ESP32-S3 estos pines pertenecen al ADC2, que NO se puede
+       usar de forma fiable al mismo tiempo que el WiFi esta activo:
+       analogRead() puede devolver 0 o basura mientras la radio
+       transmite. Este sketch SI usa WiFi, asi que la lectura se hace
+       con leerADC(), que descarta las lecturas invalidas y conserva
+       el ultimo valor bueno (ver seccion "LECTURA ADC ROBUSTA").
+       Si notas que los valores se quedan congelados, la solucion
+       definitiva es recablear esos 3 sensores a pines del ADC1
+       (GPIO 1 a 10); en esta maqueta quedan libres GPIO3 y GPIO10.
      - El pin P1 = GPIO1 y P2 = GPIO2. En algunas variantes el pin 1
        puede coincidir con TX0 de un Serial de depuracion. Si el boton
        P1 no responde bien, revisa que no este compartido con Serial.
@@ -64,6 +80,9 @@
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
 
 // ============================================================================
 // 1. DEFINICION DE PINES (tal como estan cableados en la maqueta)
@@ -126,7 +145,48 @@ const unsigned long DEBOUNCE_MS = 200;
 const unsigned long VENTANA_COMBO = 150;
 
 // Cuantas pantallas de informacion existen (ver actualizarLCD)
-const int NUM_MODOS_PANTALLA = 4;
+const int NUM_MODOS_PANTALLA = 5;
+
+// ============================================================================
+// 3.b CONFIGURACION DE RED (WiFi + hora por internet + telemetria)
+// ============================================================================
+
+// --- Credenciales del WiFi al que se conecta la maqueta ---
+const char* WIFI_SSID = "hotspot";
+const char* WIFI_PASS = "isa20261";
+
+// Cuanto esperamos como maximo a que conecte el WiFi durante el arranque.
+// Si se vence, la maqueta arranca igual en modo offline: los semaforos
+// NUNCA se quedan bloqueados esperando la red.
+const unsigned long TIMEOUT_CONEXION_WIFI = 15000;
+
+// Cada cuanto se reintenta la conexion si el WiFi se cae en caliente.
+const unsigned long INTERVALO_REINTENTO_WIFI = 20000;
+
+// --- API de hora (zona UTC-5, America/Bogota) ---
+const char* URL_API_HORA = "http://worldtimeapi.org/api/timezone/America/Bogota";
+
+// Servidores NTP de respaldo, por si la API HTTP no responde
+const char* NTP_SERVIDOR_1 = "pool.ntp.org";
+const char* NTP_SERVIDOR_2 = "time.nist.gov";
+const long  DESFASE_UTC_SEGUNDOS = -5 * 3600; // UTC-5, Colombia (sin horario de verano)
+
+// Si la sincronizacion falla, se reintenta cada cierto tiempo en segundo plano
+const unsigned long INTERVALO_REINTENTO_HORA = 60000;
+
+// --- Servidor de telemetria (mismo esquema del ejemplo de clase) ---
+const char* TELEMETRIA_HOST = "http://isa.requestcatcher.com";
+const char* TELEMETRIA_PATH = "/post";
+
+// Cada cuanto se envian los datos de trafico
+const unsigned long INTERVALO_ENVIO = 5000;
+
+// Timeouts cortos: una peticion lenta no puede congelar el cruce.
+// El de la hora se puede permitir mas margen porque solo corre en el arranque;
+// el del POST se repite cada 5 s en pleno ciclo de semaforos, asi que va mas
+// apretado (en el peor caso el loop se detiene ~1,2 s por envio fallido).
+const uint16_t TIMEOUT_HTTP_HORA = 2000;
+const uint16_t TIMEOUT_HTTP_POST = 1200;
 
 // ============================================================================
 // 4. MAQUINA DE ESTADOS DEL CRUCE
@@ -177,9 +237,28 @@ int autosCalle2Actual = 0;
 int modoPantalla = 0;
 
 
-// ---------- Variables para la hora indicada por Serial ----------
-bool horaNocheProfundaIndicada = false; // true si la última hora recibida está en 23h-4h
-int horaActualIndicada = -1;            // -1 = aún no se ha recibido ninguna hora
+// ---------- Reloj interno de la maqueta (zona UTC-5) ----------
+// El reloj se "siembra" una sola vez (con la hora de internet, o a mano por
+// Serial) y desde ahi avanza solo contando millis(). Se guarda como segundos
+// transcurridos desde la medianoche.
+bool relojSincronizado = false;         // true cuando ya tiene una hora valida
+unsigned long segundosBaseDia = 0;      // segundos desde medianoche en el instante de la siembra
+unsigned long millisBaseReloj = 0;      // valor de millis() en ese mismo instante
+String origenHora = "---";              // "API", "NTP" o "MANUAL": de donde salio la hora
+
+bool horaNocheProfundaIndicada = false; // true si la hora actual está en 23h-4h
+int horaActualIndicada = -1;            // -1 = el reloj aún no tiene hora válida
+
+// ---------- Estado de la red ----------
+bool wifiConectado = false;
+unsigned long ultimoIntentoWiFi = 0;
+unsigned long ultimoIntentoHora = 0;
+
+// ---------- Estado de la telemetria ----------
+unsigned long ultimoEnvio = 0;
+int ultimoCodigoHttp = 0;      // codigo de respuesta del ultimo POST (>0 = ok)
+unsigned long enviosOk = 0;
+unsigned long enviosFallidos = 0;
 
 // ---------- Variables para el modo de parpadeo especial ----------
 bool modoNocheProfundaActivo = false;
@@ -242,6 +321,17 @@ void setup() {
 
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0); // apagado inicial
 
+  // --- Arranque de la parte de red: conectar y pedir la hora UTC-5 ---
+  // Si algo de esto falla, la maqueta sigue funcionando en modo offline.
+  conectarWiFi();
+  if (wifiConectado) {
+    sincronizarHora(true); // arranque: puede usar el LCD y esperar
+  } else {
+    mostrarMensajeArranque("WiFi no conecto", "Modo offline");
+    delay(1500);
+  }
+  lcd.clear();
+
   tiempoInicioFase = millis();
   duracionVerdeCalculada = VERDE_MINIMO;
   aplicarSemaforos();
@@ -251,14 +341,19 @@ void setup() {
 // LOOP PRINCIPAL
 // ============================================================================
 void loop() {
-  leerComandosSerial();        
+  leerComandosSerial();
   leerSensoresDetalle();
   leerBotones();
   actualizarModoNoche();
   leerCO2();
   actualizarLedRGB();
   actualizarEmergenciaCO2();
-  
+
+  // --- Parte de red: nunca bloquea el cruce ---
+  mantenerWiFi();          // reconecta en segundo plano si se cayo el WiFi
+  actualizarReloj();       // avanza la hora y recalcula la franja 23h-4h
+  enviarDatosTrafico();    // POST cada 5 s con los vehiculos de cada calle
+
   if (!emergenciaCO2Activa) {
     actualizarMaquinaEstados();
     actualizarNocheProfunda();
@@ -279,8 +374,8 @@ void loop() {
 // tanto la maquina de estados como la pantalla usen los mismos datos)
 // ============================================================================
 void leerSensoresDetalle() {
-  luz1Actual = analogRead(LDR1);
-  luz2Actual = analogRead(LDR2);
+  leerADC(LDR1, luz1Actual);
+  leerADC(LDR2, luz2Actual);
 
   cny1Detecta = cnyDetecta(CNY1);
   cny2Detecta = cnyDetecta(CNY2);
@@ -291,6 +386,26 @@ void leerSensoresDetalle() {
 
   autosCalle1Actual = (cny1Detecta ? 1 : 0) + (cny2Detecta ? 1 : 0) + (cny3Detecta ? 1 : 0);
   autosCalle2Actual = (cny4Detecta ? 1 : 0) + (cny5Detecta ? 1 : 0) + (cny6Detecta ? 1 : 0);
+}
+
+// ============================================================================
+// LECTURA ADC ROBUSTA (convivencia con el WiFi)
+// ============================================================================
+// LDR1(13), LDR2(12) y CO2(14) estan en el ADC2 del ESP32-S3, y el ADC2 se
+// comparte con la radio WiFi: mientras la radio trabaja, analogRead() puede
+// devolver 0 aunque el sensor tenga un valor real. Como en esta maqueta un 0
+// exacto no es una lectura fisica plausible (siempre hay algo de tension en el
+// divisor), tratamos el 0 como lectura invalida y conservamos el ultimo valor
+// bueno en lugar de dejar que el sistema crea que se hizo de noche de golpe.
+//
+// Si prefieres precision total en vez de este apaño, recablea los 3 sensores a
+// pines del ADC1 (GPIO 1-10); en esta maqueta quedan libres GPIO3 y GPIO10.
+void leerADC(int pin, int &destino) {
+  int lectura = analogRead(pin);
+  if (wifiConectado && lectura == 0 && destino != 0) {
+    return; // lectura descartada: casi seguro es interferencia del WiFi
+  }
+  destino = lectura;
 }
 
 bool cnyDetecta(int pin) {
@@ -383,7 +498,7 @@ void actualizarModoNoche() {
 // LECTURA DEL SENSOR DE CO2
 // ============================================================================
 void leerCO2() {
-  co2Actual = analogRead(CO2);
+  leerADC(CO2, co2Actual);
   // NOTA: valor crudo de ADC (0-4095). Para ppm reales se necesita la
   // curva de calibracion propia del sensor (ej. MQ-135).
 }
@@ -523,12 +638,14 @@ void actualizarLCD() {
     case 1: dibujarPantallaCalle1();    break;
     case 2: dibujarPantallaCalle2();    break;
     case 3: dibujarPantallaSistema();   break;
+    case 4: dibujarPantallaRed();       break;
   }
 }
 
 // ============================================================================
 // MODO NOCTURNO PROFUNDO: LY1 y LR2 parpadean SOLO si ambos LDR detectan
-// baja luz Y la hora indicada por Serial cae en 23h-4h.
+// baja luz Y la hora del reloj interno cae en 23h-4h. Esa hora ahora viene
+// sincronizada de internet en UTC-5 (o forzada a mano con HORA:<0-23>).
 // ============================================================================
 void actualizarNocheProfunda() {
   bool ambosLdrBajos = (luz1Actual < UMBRAL_NOCHE) && (luz2Actual < UMBRAL_NOCHE);
@@ -567,7 +684,7 @@ void actualizarNocheProfunda() {
     //     no confirman baja luz en ambas vias ---
     if (horaNocheProfundaIndicada && !ambosLdrBajos) {
       if (!advertenciaHoraMostrada) {
-        Serial.println(F("ADVERTENCIA: se indico horario 23h-4h pero los sensores no detectan baja luz en ambas vias. No es la hora correcta."));
+        Serial.println(F("ADVERTENCIA: el reloj marca horario 23h-4h pero los sensores no detectan baja luz en ambas vias."));
         advertenciaHoraMostrada = true;
       }
     } else {
@@ -665,25 +782,371 @@ String nombreFaseLarga() {
   return "";
 }
 
+// ############################################################################
+// #                        BLOQUE DE RED (WiFi / HORA / POST)                #
+// ############################################################################
+
 // ============================================================================
-// LECTURA DE COMANDOS POR SERIAL (protocolo: "HORA:<0-23>")
+// CONEXION WIFI
 // ============================================================================
+// Importante: el arranque espera como maximo TIMEOUT_CONEXION_WIFI. Si el
+// hotspot no aparece, la maqueta NO se queda colgada: sigue al ciclo normal
+// de semaforos en modo offline y reintenta la conexion desde el loop.
+void conectarWiFi() {
+  Serial.print(F("[WIFI]\tConectando a SSID: "));
+  Serial.println(WIFI_SSID);
+
+  mostrarMensajeArranque("Conectando WiFi", WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - inicio) < TIMEOUT_CONEXION_WIFI) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  wifiConectado = (WiFi.status() == WL_CONNECTED);
+  ultimoIntentoWiFi = millis();
+
+  if (wifiConectado) {
+    Serial.print(F("[WIFI]\tConectado. IP: "));
+    Serial.println(WiFi.localIP());
+    Serial.print(F("[WIFI]\tIntensidad de senal (RSSI): "));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm"));
+    mostrarMensajeArranque("WiFi OK", WiFi.localIP().toString().c_str());
+    delay(1200);
+  } else {
+    Serial.println(F("[WIFI]\tNo se pudo conectar. Arrancando en modo offline."));
+  }
+}
+
+// Vigila el enlace desde el loop y reintenta sin bloquear nada.
+void mantenerWiFi() {
+  bool conectadoAhora = (WiFi.status() == WL_CONNECTED);
+
+  if (conectadoAhora) {
+    if (!wifiConectado) {
+      wifiConectado = true;
+      Serial.print(F("[WIFI]\tReconectado. IP: "));
+      Serial.println(WiFi.localIP());
+    }
+    // Si el WiFi volvio pero el reloj nunca llego a sincronizarse, se
+    // reintenta cada tanto en segundo plano.
+    if (!relojSincronizado && (millis() - ultimoIntentoHora) > INTERVALO_REINTENTO_HORA) {
+      ultimoIntentoHora = millis();
+      sincronizarHora(false); // reintento de fondo: sin LCD ni delays largos
+    }
+    return;
+  }
+
+  if (wifiConectado) {
+    wifiConectado = false;
+    Serial.println(F("[WIFI]\tEnlace perdido. Reintentando en segundo plano."));
+  }
+
+  if ((millis() - ultimoIntentoWiFi) > INTERVALO_REINTENTO_WIFI) {
+    ultimoIntentoWiFi = millis();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS); // no esperamos aqui: el loop debe seguir
+  }
+}
+
+// ============================================================================
+// SINCRONIZACION DE LA HORA (zona UTC-5)
+// ============================================================================
+// Se intenta primero la API HTTP de hora y, si no responde, se cae a NTP.
+// El resultado se "siembra" en el reloj interno, que a partir de ahi avanza
+// solo con millis() (no hace falta volver a consultar internet).
+// El parametro mostrarEnLcd distingue los dos usos:
+//   true  -> arranque o RESYNC manual: se puede usar el LCD y hacer delay()
+//   false -> reintento automatico desde el loop: NADA de LCD ni de delay(),
+//            porque congelar el loop un segundo y medio en pleno ciclo
+//            dejaria los semaforos clavados en una fase.
+bool sincronizarHora(bool mostrarEnLcd) {
+  if (mostrarEnLcd) mostrarMensajeArranque("Sincronizando", "hora UTC-5...");
+
+  if (sincronizarHoraDesdeAPI()) {
+    if (mostrarEnLcd) {
+      mostrarMensajeArranque("Hora API OK", horaFormateada().c_str());
+      delay(1500);
+    }
+    return true;
+  }
+
+  Serial.println(F("[HORA]\tLa API no respondio. Intentando por NTP..."));
+  // En el arranque podemos esperar tranquilos; en un reintento de fondo no.
+  if (sincronizarHoraDesdeNTP(mostrarEnLcd ? 8000 : 1500)) {
+    if (mostrarEnLcd) {
+      mostrarMensajeArranque("Hora NTP OK", horaFormateada().c_str());
+      delay(1500);
+    }
+    return true;
+  }
+
+  Serial.println(F("[HORA]\tNo se pudo obtener la hora. Usa HORA:<0-23> por Serial."));
+  if (mostrarEnLcd) {
+    mostrarMensajeArranque("Sin hora", "Usa HORA:<0-23>");
+    delay(1500);
+  }
+  return false;
+}
+
+// --- Opcion 1: API HTTP de tiempo ---
+// worldtimeapi devuelve un JSON con el campo:
+//   "datetime":"2026-09-09T14:23:11.123456-05:00"
+// Solo nos interesa el tramo HH:MM:SS que va justo despues de la 'T', y como
+// pedimos la zona America/Bogota ya viene convertido a UTC-5.
+bool sincronizarHoraDesdeAPI() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.setConnectTimeout(TIMEOUT_HTTP_HORA);
+  http.setTimeout(TIMEOUT_HTTP_HORA);
+
+  if (!http.begin(URL_API_HORA)) {
+    Serial.println(F("[HORA]\tNo se pudo abrir la conexion con la API."));
+    return false;
+  }
+
+  int codigo = http.GET();
+  if (codigo != HTTP_CODE_OK) {
+    Serial.print(F("[HORA]\tLa API respondio con codigo: "));
+    Serial.println(codigo);
+    http.end();
+    return false;
+  }
+
+  String cuerpo = http.getString();
+  http.end();
+
+  int posCampo = cuerpo.indexOf("\"datetime\"");
+  if (posCampo < 0) {
+    Serial.println(F("[HORA]\tRespuesta sin campo datetime."));
+    return false;
+  }
+
+  // Nos paramos en la 'T' que separa fecha de hora dentro de ese campo
+  int posT = cuerpo.indexOf('T', posCampo);
+  if (posT < 0 || cuerpo.length() < (unsigned int)(posT + 9)) {
+    Serial.println(F("[HORA]\tFormato de datetime inesperado."));
+    return false;
+  }
+
+  int h = cuerpo.substring(posT + 1, posT + 3).toInt();
+  int m = cuerpo.substring(posT + 4, posT + 6).toInt();
+  int s = cuerpo.substring(posT + 7, posT + 9).toInt();
+
+  if (h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) {
+    Serial.println(F("[HORA]\tLa API devolvio una hora fuera de rango."));
+    return false;
+  }
+
+  sembrarReloj(h, m, s, "API");
+  return true;
+}
+
+// --- Opcion 2 (respaldo): NTP ---
+// configTime aplica el desfase UTC-5 directamente, asi que la struct tm que
+// devuelve getLocalTime ya viene en hora de Colombia.
+bool sincronizarHoraDesdeNTP(unsigned long esperaMaxima) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  configTime(DESFASE_UTC_SEGUNDOS, 0, NTP_SERVIDOR_1, NTP_SERVIDOR_2);
+
+  struct tm datos;
+  if (!getLocalTime(&datos, esperaMaxima)) {
+    Serial.println(F("[HORA]\tNTP no respondio a tiempo."));
+    return false;
+  }
+
+  sembrarReloj(datos.tm_hour, datos.tm_min, datos.tm_sec, "NTP");
+  return true;
+}
+
+// Deja el reloj interno en la hora indicada y anota desde que instante de
+// millis() empieza a contar.
+void sembrarReloj(int h, int m, int s, const char* origen) {
+  segundosBaseDia = (unsigned long)h * 3600UL + (unsigned long)m * 60UL + (unsigned long)s;
+  millisBaseReloj = millis();
+  relojSincronizado = true;
+  origenHora = String(origen);
+
+  Serial.print(F("[HORA]\tReloj sincronizado ("));
+  Serial.print(origenHora);
+  Serial.print(F(") -> "));
+  Serial.print(horaFormateada());
+  Serial.println(F(" (UTC-5)"));
+
+  actualizarReloj();
+}
+
+// Segundos transcurridos desde la medianoche, segun el reloj interno.
+unsigned long segundosDelDia() {
+  if (!relojSincronizado) return 0;
+  unsigned long transcurridos = (millis() - millisBaseReloj) / 1000UL;
+  return (segundosBaseDia + transcurridos) % 86400UL;
+}
+
+// Recalcula la hora actual y, con ella, si estamos en la franja de noche
+// profunda (23h-4h). Antes esto dependia de escribir HORA: por Serial; ahora
+// sale solo del reloj y se actualiza sin intervencion.
+void actualizarReloj() {
+  if (!relojSincronizado) {
+    horaActualIndicada = -1;
+    horaNocheProfundaIndicada = false;
+    return;
+  }
+
+  int hora = (int)(segundosDelDia() / 3600UL);
+  horaActualIndicada = hora;
+  horaNocheProfundaIndicada = (hora >= 23 || hora <= 4);
+}
+
+// Formatea un numero a 2 digitos ("7" -> "07") para que el reloj no baile
+String dosDigitos(int valor) {
+  return (valor < 10) ? ("0" + String(valor)) : String(valor);
+}
+
+// "HH:MM:SS" para el tablero digital y los logs
+String horaFormateada() {
+  if (!relojSincronizado) return "--:--:--";
+  unsigned long total = segundosDelDia();
+  return dosDigitos(total / 3600UL) + ":" +
+         dosDigitos((total % 3600UL) / 60UL) + ":" +
+         dosDigitos(total % 60UL);
+}
+
+// "HH:MM", para cuando no caben los segundos en la fila del LCD
+String horaCorta() {
+  if (!relojSincronizado) return "--:--";
+  unsigned long total = segundosDelDia();
+  return dosDigitos(total / 3600UL) + ":" + dosDigitos((total % 3600UL) / 60UL);
+}
+
+// ============================================================================
+// TELEMETRIA: POST con el numero de vehiculos de cada calle (cada 5 s)
+// ============================================================================
+// Se manda de las dos formas para que sea comodo de revisar en requestcatcher:
+//   - en la query string, como en el ejemplo de clase
+//     (/post?vehiculos_calle1=2&vehiculos_calle2=1)
+//   - y en el cuerpo, como JSON con el detalle sensor por sensor
+void enviarDatosTrafico() {
+  if ((millis() - ultimoEnvio) < INTERVALO_ENVIO) return;
+  ultimoEnvio = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[SEND]\tSin WiFi: envio omitido."));
+    return;
+  }
+
+  String url = String(TELEMETRIA_HOST) + TELEMETRIA_PATH +
+               "?vehiculos_calle1=" + String(autosCalle1Actual) +
+               "&vehiculos_calle2=" + String(autosCalle2Actual);
+
+  String cuerpo = "{";
+  cuerpo += "\"hora\":\"" + horaFormateada() + "\",";
+  cuerpo += "\"vehiculos_calle1\":" + String(autosCalle1Actual) + ",";
+  cuerpo += "\"vehiculos_calle2\":" + String(autosCalle2Actual) + ",";
+  cuerpo += "\"sensores_calle1\":[" + String(cny1Detecta ? 1 : 0) + "," +
+                                      String(cny2Detecta ? 1 : 0) + "," +
+                                      String(cny3Detecta ? 1 : 0) + "],";
+  cuerpo += "\"sensores_calle2\":[" + String(cny4Detecta ? 1 : 0) + "," +
+                                      String(cny5Detecta ? 1 : 0) + "," +
+                                      String(cny6Detecta ? 1 : 0) + "],";
+  cuerpo += "\"fase\":\"" + nombreFaseLarga() + "\",";
+  cuerpo += "\"co2\":" + String(co2Actual) + ",";
+  cuerpo += "\"modo_noche\":" + String(modoNoche ? "true" : "false");
+  cuerpo += "}";
+
+  HTTPClient http;
+  http.setConnectTimeout(TIMEOUT_HTTP_POST);
+  http.setTimeout(TIMEOUT_HTTP_POST);
+
+  if (!http.begin(url)) {
+    Serial.println(F("[SEND]\tNo se pudo abrir la conexion con el servidor."));
+    enviosFallidos++;
+    ultimoCodigoHttp = -1;
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  ultimoCodigoHttp = http.POST(cuerpo);
+  http.end();
+
+  Serial.print(F("[SEND]\tCalle1: "));
+  Serial.print(autosCalle1Actual);
+  Serial.print(F(" | Calle2: "));
+  Serial.print(autosCalle2Actual);
+  Serial.print(F(" | status-code: "));
+  Serial.println(ultimoCodigoHttp);
+
+  if (ultimoCodigoHttp > 0) enviosOk++;
+  else enviosFallidos++;
+}
+
+// Mensaje de dos lineas para las fases de arranque (WiFi, hora, etc.)
+void mostrarMensajeArranque(const char* linea1, const char* linea2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(linea1);
+  lcd.setCursor(0, 1);
+  lcd.print(linea2);
+}
+
+// ============================================================================
+// LECTURA DE COMANDOS POR SERIAL
+// ============================================================================
+//   HORA:<0-23>  fuerza la hora del reloj interno (para la demo)
+//   RESYNC       vuelve a pedir la hora a internet
+//   RED          imprime IP, hora vigente y contadores de envio
 void leerComandosSerial() {
   if (Serial.available() > 0) {
     String comando = Serial.readStringUntil('\n');
     comando.trim();
 
+    // --- HORA:<0-23> : fuerza la hora a mano (util para la demo) ---
+    // Ojo: ya no basta con mover la bandera, porque actualizarReloj() la
+    // recalcula cada vuelta del loop a partir del reloj interno. Por eso el
+    // comando resiembra el reloj completo, y desde ahi sigue avanzando solo.
     if (comando.startsWith("HORA:")) {
       int hora = comando.substring(5).toInt();
       if (hora >= 0 && hora <= 23) {
-        horaActualIndicada = hora;
-        horaNocheProfundaIndicada = (hora >= 23 || hora <= 4);
-        Serial.print(F("Hora recibida: "));
+        sembrarReloj(hora, 0, 0, "MANUAL");
+        Serial.print(F("Hora forzada a mano: "));
         Serial.print(hora);
         Serial.println(horaNocheProfundaIndicada ? F("h (dentro de 23h-4h)") : F("h (fuera de ese rango)"));
       } else {
         Serial.println(F("Formato invalido. Usa HORA:0 a HORA:23"));
       }
+    }
+
+    // --- RESYNC : vuelve a pedir la hora a internet ---
+    else if (comando.equalsIgnoreCase("RESYNC")) {
+      if (WiFi.status() == WL_CONNECTED) {
+        sincronizarHora(true); // lo pidio una persona: si mostramos avance
+        lcd.clear();
+      } else {
+        Serial.println(F("RESYNC ignorado: no hay WiFi."));
+      }
+    }
+
+    // --- RED : muestra el estado de la conexion y de los envios ---
+    else if (comando.equalsIgnoreCase("RED")) {
+      Serial.print(F("[RED]\tWiFi: "));
+      Serial.println(wifiConectado ? WiFi.localIP().toString() : String("desconectado"));
+      Serial.print(F("[RED]\tHora: "));
+      Serial.print(horaFormateada());
+      Serial.print(F(" (origen "));
+      Serial.print(origenHora);
+      Serial.println(F(")"));
+      Serial.print(F("[RED]\tEnvios OK/fallidos: "));
+      Serial.print(enviosOk);
+      Serial.print('/');
+      Serial.println(enviosFallidos);
     }
   }
 }
@@ -699,11 +1162,16 @@ void actualizarLedRGB() {
 }
 
 // --- MODO 1: Resumen general de todo el cruce ---
+// La fila 0 antes se pasaba de los 16 caracteres y el indicador "M1" se
+// perdia al truncar; ahora entra justo. La fila 3 lleva ademas el reloj en
+// formato corto para tener la hora siempre a la vista en el tablero.
 void dibujarPantallaResumen() {
-  imprimirFila(0, "C1:" + faseCortaCalle1() + " C2:" + faseCortaCalle2() + "   M1");
+  imprimirFila(0, "C1:" + faseCortaCalle1() + " C2:" + faseCortaCalle2() + " M1");
   imprimirFila(1, "Resta:" + String(tiempoRestanteFase()) + "s CO2:" + (co2Actual >= UMBRAL_CO2_ALTO ? "ALTO" : "OK"));
   imprimirFila(2, "Autos C1:" + String(autosCalle1Actual) + " C2:" + String(autosCalle2Actual));
-  imprimirFila(3, "Noche:" + String(modoNoche ? "SI" : "NO") + " Ped:" + String((solicitudPeaton1 || solicitudPeaton2) ? "SI" : "NO"));
+  imprimirFila(3, "N:" + String(modoNoche ? "SI" : "NO") +
+                   " P:" + String((solicitudPeaton1 || solicitudPeaton2) ? "SI" : "NO") +
+                   " " + horaCorta());
 }
 
 // --- MODO 2: Detalle sensor por sensor de la Calle 1 ---
@@ -732,6 +1200,17 @@ void dibujarPantallaSistema() {
   imprimirFila(1, "CO2 crudo:" + String(co2Actual));
   imprimirFila(2, "Luz1:" + String(luz1Actual) + " Luz2:" + String(luz2Actual));
   imprimirFila(3, nombreFaseLarga() + " " + String(tiempoRestanteFase()) + "s");
+}
+
+// --- MODO 5: Reloj y estado de la conexion ---
+// Es el "tablero digital" de la hora: muestra HH:MM:SS del reloj sincronizado
+// en UTC-5, de donde salio esa hora, si el WiFi esta arriba y como van los
+// envios de telemetria.
+void dibujarPantallaRed() {
+  imprimirFila(0, "--RED/HORA--  M5");
+  imprimirFila(1, horaFormateada() + " " + origenHora);
+  imprimirFila(2, wifiConectado ? WiFi.localIP().toString() : String("WiFi: OFFLINE"));
+  imprimirFila(3, "POST ok:" + String(enviosOk) + " er:" + String(enviosFallidos));
 }
 
 // ============================================================================

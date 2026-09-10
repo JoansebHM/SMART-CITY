@@ -27,7 +27,13 @@ y **en qué línea exacta del código se ejecuta**, para poder mostrarlo en vivo
 | `UMBRAL_CO2_ALTO` | 121 | 2500 | Umbral de CO2 (ADC 0-4095) a partir del cual el aire se considera cargado |
 | `DEBOUNCE_MS` | 123 | 200 ms | Antirrebote de cada botón |
 | `VENTANA_COMBO` | 127 | 150 ms | Ventana para detectar que P1 y P2 se pulsaron juntos |
-| `NUM_MODOS_PANTALLA` | 130 | 4 | Cantidad de pantallas disponibles en el LCD |
+| `NUM_MODOS_PANTALLA` | 130 | 5 | Cantidad de pantallas disponibles en el LCD |
+| `WIFI_SSID` / `WIFI_PASS` | — | `hotspot` / `isa20261` | Red a la que se conecta la maqueta |
+| `TIMEOUT_CONEXION_WIFI` | — | 15000 ms | Espera máxima de WiFi al arrancar; si vence, arranca offline |
+| `URL_API_HORA` | — | worldtimeapi (America/Bogota) | API de donde se toma la hora UTC-5 |
+| `DESFASE_UTC_SEGUNDOS` | — | -18000 | Desfase UTC-5 usado por el respaldo NTP |
+| `INTERVALO_ENVIO` | — | 5000 ms | Cada cuánto se hace el POST de vehículos |
+| `TIMEOUT_HTTP_POST` | — | 1200 ms | Tope de bloqueo por envío fallido |
 
 ### 1.2 Variables de estado (cambian en tiempo real)
 
@@ -42,7 +48,7 @@ y **en qué línea exacta del código se ejecuta**, para poder mostrarlo en vivo
 | `luz1Actual` / `luz2Actual` | 170-171 | Última lectura cruda de LDR1 / LDR2 |
 | `cny1Detecta` ... `cny6Detecta` | 172-173 | Estado booleano de cada sensor infrarrojo, actualizado cada vuelta del loop |
 | `autosCalle1Actual` / `autosCalle2Actual` | 174-175 | Cantidad de sensores CNY activos (0 a 3) en cada calle |
-| `modoPantalla` | 178 | Índice (0 a 3) de qué pantalla del LCD se está mostrando |
+| `modoPantalla` | 178 | Índice (0 a 4) de qué pantalla del LCD se está mostrando |
 
 ---
 
@@ -121,7 +127,7 @@ consume en el próximo ciclo de `VERDE_CALLE1`.
 **Cómo simularlo:** pulsa P1 y P2 **al mismo tiempo** (dentro de ~150 ms uno
 del otro).
 **Qué debe pasar:** el LCD se limpia y pasa a la siguiente pantalla
-(M1→M2→M3→M4→M1...).
+(M1→M2→M3→M4→M5→M1...).
 **Línea:**
 - Detección de combo: `leerBotones()`, líneas 290-299
 - Cambio de pantalla: `cambiarModoPantalla()`, línea 329
@@ -191,10 +197,10 @@ lecturas previas.
 
 ---
 
-## 9. Las 4 pantallas del LCD (16x4)
+## 9. Las 5 pantallas del LCD (16x4)
 
 Se navega entre ellas con el combo P1+P2 (caso 5.1). Función que decide cuál
-dibujar: `actualizarLCD()`, línea 481, `switch(modoPantalla)` línea 486.
+dibujar: `actualizarLCD()`, `switch(modoPantalla)`.
 
 ### Pantalla M1 — Resumen general
 Función: `dibujarPantallaResumen()`, línea 555.
@@ -204,7 +210,10 @@ Función: `dibujarPantallaResumen()`, línea 555.
 | 0 | Fase corta de cada calle (VER/AMA/ROJ) + indicador de pantalla | `C1:VER C2:ROJ   M1` |
 | 1 | Segundos restantes de la fase actual + estado del CO2 | `Resta:4s CO2:OK` |
 | 2 | Cantidad de autos detectados en cada calle | `Autos C1:2 C2:0` |
-| 3 | Si es de noche + si hay alguna petición peatonal pendiente | `Noche:NO Ped:SI` |
+| 3 | Modo noche + petición peatonal pendiente + **reloj HH:MM** | `N:NO P:SI 20:15` |
+
+> La fila 0 se acortó a `C1:VER C2:ROJ M1` porque la versión anterior se pasaba
+> de 16 caracteres y el indicador de pantalla se perdía al truncar.
 
 ### Pantalla M2 — Detalle Calle 1
 Función: `dibujarPantallaCalle1()`, línea 563.
@@ -237,9 +246,99 @@ Función: `dibujarPantallaSistema()`, línea 583.
 | 2 | Valores crudos de ambos LDR juntos | `Luz1:612 Luz2:590` |
 | 3 | Nombre completo de la fase actual + segundos restantes | `Verde C1 4s` |
 
+### Pantalla M5 — Red y hora
+Función: `dibujarPantallaRed()`. Es el tablero digital de la hora.
+
+| Fila | Contenido | Ejemplo |
+|---|---|---|
+| 0 | Título + indicador de pantalla | `--RED/HORA--  M5` |
+| 1 | Hora UTC-5 del reloj interno + de dónde salió | `20:15:42 API` |
+| 2 | IP asignada, o aviso de que no hay red | `192.168.1.37` |
+| 3 | Contadores de POST correctos y fallidos | `POST ok:12 er:0` |
+
 ---
 
-## 10. Guion sugerido de demostración (orden recomendado)
+## 10. Conectividad: hora por internet y envío de tráfico
+
+### 10.1 Recepción — hora UTC-5 al arrancar
+
+En `setup()` la maqueta conecta al WiFi y pide la hora de la zona
+`America/Bogota` (UTC-5). Esa hora **siembra un reloj interno** que a partir
+de ahí avanza solo con `millis()`, sin volver a consultar internet.
+
+Cadena de intentos (`sincronizarHora()`):
+
+1. **API HTTP** (`sincronizarHoraDesdeAPI()`): GET a worldtimeapi, del que se
+   extrae el tramo `HH:MM:SS` que sigue a la `T` del campo `datetime`. Como se
+   pide directamente la zona de Bogotá, ya viene convertido a UTC-5.
+2. **NTP de respaldo** (`sincronizarHoraDesdeNTP()`): `configTime()` con
+   desfase −18000 s, por si la API no responde.
+3. **Manual**: si ambos fallan, se puede sembrar con `HORA:<0-23>` por Serial.
+
+**Efecto sobre el sistema:** el modo *noche profunda* (parpadeo de LY1+LR2 en
+la franja 23h–4h) ya no depende de que alguien escriba la hora por Serial;
+`actualizarReloj()` la recalcula sola cada vuelta del loop.
+
+**Cómo demostrarlo:** al encender, el LCD muestra `Conectando WiFi` → `WiFi OK`
+con la IP → `Hora API OK` con la hora. Luego, en pantalla M5, el reloj avanza
+segundo a segundo. Para forzar la franja nocturna sin esperar a las 23h, envía
+`HORA:23` por Serial y tapa ambos LDR.
+
+### 10.2 Envío — POST de vehículos cada 5 s
+
+`enviarDatosTrafico()` manda cada 5 segundos a `isa.requestcatcher.com/post`
+el número de vehículos detectados en cada calle, de dos formas a la vez:
+
+- **Query string** (como el ejemplo de clase):
+  `/post?vehiculos_calle1=2&vehiculos_calle2=1`
+- **Cuerpo JSON** con el detalle:
+
+```json
+{
+  "hora": "20:15:42",
+  "vehiculos_calle1": 2,
+  "vehiculos_calle2": 1,
+  "sensores_calle1": [1,1,0],
+  "sensores_calle2": [0,0,1],
+  "fase": "Verde C1",
+  "co2": 1340,
+  "modo_noche": false
+}
+```
+
+**Cómo demostrarlo:** abre `https://isa.requestcatcher.com` en el navegador y
+activa/desactiva los CNY con un objeto blanco; cada 5 s aparece una petición
+nueva con el conteo actualizado. El monitor Serial imprime la misma línea con
+el `status-code`.
+
+### 10.3 Comandos Serial disponibles
+
+| Comando | Qué hace |
+|---|---|
+| `HORA:<0-23>` | Fuerza la hora del reloj interno (para la demo) |
+| `RESYNC` | Vuelve a pedir la hora a internet |
+| `RED` | Imprime IP, hora vigente, origen y contadores de envío |
+
+### 10.4 Dos advertencias importantes
+
+**a) Conflicto ADC2 + WiFi.** LDR1(13), LDR2(12) y CO2(14) están en el ADC2 del
+ESP32-S3, que se comparte con la radio WiFi: mientras la radio trabaja,
+`analogRead()` puede devolver 0 aunque el sensor tenga un valor real. Por eso
+las tres lecturas pasan por `leerADC()`, que descarta el 0 como lectura
+inválida y conserva el último valor bueno. **Es un apaño, no una solución.** Si
+ves los valores congelados o erráticos, recablea esos tres sensores a pines del
+ADC1 (GPIO 1–10); en esta maqueta quedan libres **GPIO3 y GPIO10** (harían
+falta tres, así que habría que liberar uno más).
+
+**b) La red nunca bloquea el cruce.** Si el WiFi no conecta en 15 s, la maqueta
+arranca en modo offline y el ciclo de semáforos funciona igual; los reintentos
+de conexión y de sincronización de hora corren desde el loop sin `delay()`. El
+único bloqueo posible en operación normal es un POST fallido, acotado a ~1,2 s
+por `TIMEOUT_HTTP_POST`.
+
+---
+
+## 11. Guion sugerido de demostración (orden recomendado)
 
 1. **Arranque:** muestra el reinicio y el mensaje de bienvenida (caso 8.1).
 2. **Ciclo normal:** deja correr un ciclo completo sin tocar nada, mostrando
