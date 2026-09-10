@@ -162,8 +162,8 @@ const int NUM_MODOS_PANTALLA      = 5;
 // Todo lo de red corre en una tarea aparte (ver tareaRed) para que ninguna
 // espera de internet pueda congelar el cruce, la consola ni el LCD.
 
-const char* WIFI_SSID = "Familia HM";
-const char* WIFI_PASS = "PepisySebas123*";
+const char* WIFI_SSID = "Trapera";
+const char* WIFI_PASS = "cepillin";
 
 // Si el WiFi se cae, cada cuanto se reintenta (sin bloquear el loop)
 const unsigned long INTERVALO_REINTENTO_WIFI = 20000;
