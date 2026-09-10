@@ -70,7 +70,13 @@
       "Bash(awk '/void cmdSecuencia/,/^}/' Comandos.ino)",
       "Bash(node /private/tmp/claude-501/-Users-joansebhm-Documents-EAFIT-ISA-CIUDAD-AUTOADAPTABLE/91aae88c-6ae8-4946-87c7-f03b830e005e/scratchpad/caso2.mjs)",
       "Bash(ls /Users/joansebhm/.claude/projects/-Users-joansebhm-Documents-EAFIT-ISA-CIUDAD-AUTOADAPTABLE/memory/ 2>&1)",
-      "Read(//Users/joansebhm/.claude/projects/-Users-joansebhm-Documents-EAFIT-ISA-CIUDAD-AUTOADAPTABLE/memory/**)"
+      "Read(//Users/joansebhm/.claude/projects/-Users-joansebhm-Documents-EAFIT-ISA-CIUDAD-AUTOADAPTABLE/memory/**)",
+      "Bash(git checkout *)",
+      "Bash('/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli' compile --fqbn esp32:esp32:esp32s3 SmartCity_Maqueta)",
+      "Bash(node --input-type=module -e ' *)",
+      "Bash(curl -s -m 15 -o /tmp/wta.txt -w \"HTTP %{http_code} | %{time_total}s | redirect: %{redirect_url}\\\\n\" \"http://worldtimeapi.org/api/timezone/America/Bogota\")",
+      "Bash(curl -s -m 12 \"http://worldclockapi.com/api/json/utc/now\")",
+      "Bash(perl -pi -e 's/if \\\\\\(lcdPresente\\\\\\) lcd\\\\.clear\\\\\\(\\\\\\);/limpiarLCD\\(\\);/g' SmartCity_Maqueta.ino Comandos.ino)"
     ],
     "additionalDirectories": [
       "/private/tmp"

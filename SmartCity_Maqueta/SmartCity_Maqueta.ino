@@ -20,15 +20,25 @@
    COMPORTAMIENTO AUTOADAPTABLE
      1. TRAFICO   : mas sensores CNY activos en una calle => verde mas largo.
      2. PEATONES  : P1/P2 acortan el verde de su calle al minimo.
-     3. LUZ (LDR) : de noche los LEDs bajan su brillo (PWM).
+     3. LUZ (LDR) : los LDR solo sirven de indicador (dia/noche) y como
+                    condicion de la noche profunda. NO atenuan los LEDs: el
+                    brillo es siempre el mismo, se tapen o no los sensores.
      4. CO2       : si el aire esta cargado, se reduce el verde maximo; el LED
                     RGB de la placa lo indica (verde = OK, rojo = critico) y
                     si pasa el umbral se entra en EMERGENCIA: el ciclo se
                     congela con LG2+LR1 para evacuar por la Calle 2.
-     5. LCD I2C   : 4 pantallas de informacion; se rotan con P1+P2 juntos.
-     6. HORA      : con el comando "hora <0-23>" se le dice al sistema que
-                    hora es. Si la hora cae en 23h-4h Y los dos LDR ven poca
-                    luz, se entra en NOCHE PROFUNDA: LY1 y LR2 parpadean.
+     5. LCD I2C   : 5 pantallas de informacion; se rotan con P1+P2 juntos.
+     6. HORA      : al arrancar, la maqueta pide por WiFi la hora real en
+                    zona UTC-5 (primero por NTP, y si esa red bloquea el
+                    puerto 123, por una API HTTP) y la guarda en un reloj
+                    interno que avanza solo con millis(). Tambien se puede
+                    forzar a mano con "hora <0-23>". Si la hora cae en 23h-4h
+                    Y los dos LDR ven poca luz, se entra en NOCHE PROFUNDA:
+                    LY1 y LR2 parpadean.
+     7. TELEMETRIA: cada 5 s se envia por WiFi un POST con el numero de
+                    vehiculos de cada calle al servidor de pruebas
+                    (requestcatcher). Es independiente del dashboard, que
+                    sigue hablando por el puerto Serial.
 
    NOVEDAD: CONSOLA SERIAL
    -----------------------
@@ -42,8 +52,14 @@
    y escribe:  ayuda
 
    NOTAS DE HARDWARE
-     - LDR1(13), LDR2(12) y CO2(14) son analogicos (ADC2). No se usa WiFi,
-       asi que no hay conflicto.
+     - LDR1(13), LDR2(12) y CO2(14) son analogicos y estan en el ADC2, que
+       el ESP32-S3 comparte con la radio WiFi: mientras la radio trabaja,
+       analogRead() puede devolver 0 aunque el sensor tenga un valor real.
+       Como ahora SI se usa WiFi, esas lecturas pasan por leerADC(), que
+       descarta el 0 y conserva el ultimo valor bueno. Es un apaño; si ves
+       lecturas congeladas, la solucion de verdad es recablear esos tres
+       sensores al ADC1 (GPIO 1-10). Tambien puedes esquivarlo del todo
+       simulando los valores por consola ("ldr 1 800", "co2 2600").
      - Los CNY detectan objetos blancos. Por defecto se asume que el sensor
        entrega LOW cuando SI detecta; cambia cnyActivoEnBajo si es al reves.
      - Libreria necesaria: "LiquidCrystal I2C" (Frank de Brabander).
@@ -52,6 +68,9 @@
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
 
 // ============================================================================
 // 1. PINES
@@ -89,9 +108,33 @@ const char* NOM_LED[6] = { "lr1", "ly1", "lg1", "lr2", "ly2", "lg2" };
 // 2. LCD I2C 16x4
 // ============================================================================
 #define DIRECCION_LCD 0x27      // prueba 0x3F si el tuyo no responde
-LiquidCrystal_I2C lcd(DIRECCION_LCD, 16, 4);
+const uint8_t LCD_COLUMNAS = 16;
+const uint8_t LCD_FILAS    = 4;
+
+LiquidCrystal_I2C lcd(DIRECCION_LCD, LCD_COLUMNAS, LCD_FILAS);
 bool lcdEncendido = true;
 bool lcdPresente  = false;      // se detecta en setup(); si es false, se ignora el LCD
+
+// --- Buffers para redibujar solo lo que cambia (ver volcarPantalla) ---
+// lcdEnPantalla = lo que creemos que el LCD esta mostrando ahora
+// lcdDeseado    = lo que queremos que muestre en el proximo refresco
+char lcdEnPantalla[LCD_FILAS][LCD_COLUMNAS];
+char lcdDeseado[LCD_FILAS][LCD_COLUMNAS];
+
+const unsigned long INTERVALO_REFRESCO_LCD = 400;
+
+// Cada cuanto se comprueba que el LCD sigue respondiendo en el bus I2C
+const unsigned long INTERVALO_CHEQUEO_LCD = 2000;
+
+// Reinicio preventivo del LCD (0 = desactivado). Hace falta porque el chequeo
+// I2C solo detecta que el expansor deje de contestar; si lo que se corrompe es
+// un comando que llega al HD44780 (por ejemplo un "display off"), el expansor
+// sigue respondiendo tan normal y la pantalla se queda en blanco para siempre.
+const unsigned long INTERVALO_REINIT_LCD = 60000;
+
+const uint8_t FALLOS_I2C_PARA_REINICIAR = 2;
+uint8_t fallosI2CSeguidos = 0;
+unsigned long recuperacionesLCD = 0;
 
 // ============================================================================
 // 3. PARAMETROS DEL SISTEMA (ahora son variables: se cambian por Serial)
@@ -107,11 +150,65 @@ unsigned long tiempoTodoRojo   = 1000;
 int umbralNoche   = 800;
 int brilloDia     = 255;
 int brilloNoche   = 60;
-int umbralCo2Alto = 2500;
+int umbralCo2Alto = 20500;
 
 const unsigned long DEBOUNCE_MS   = 200;
 const unsigned long VENTANA_COMBO = 150;
-const int NUM_MODOS_PANTALLA      = 4;
+const int NUM_MODOS_PANTALLA      = 5;
+
+// ============================================================================
+// 3.b RED: WiFi, hora por internet y telemetria HTTP
+// ============================================================================
+// Todo lo de red corre en una tarea aparte (ver tareaRed) para que ninguna
+// espera de internet pueda congelar el cruce, la consola ni el LCD.
+
+const char* WIFI_SSID = "Familia HM";
+const char* WIFI_PASS = "PepisySebas123*";
+
+// Si el WiFi se cae, cada cuanto se reintenta (sin bloquear el loop)
+const unsigned long INTERVALO_REINTENTO_WIFI = 20000;
+
+// --- De donde se saca la hora, en orden de preferencia ---
+//
+// 1) NTP. Es el metodo principal: es el protocolo hecho para esto, no usa TLS,
+//    no hay que parsear nada y funciona en practicamente cualquier red.
+//    configTime() ya aplica el desfase, asi que la hora sale en UTC-5.
+const char* NTP_SERVIDOR_1 = "pool.ntp.org";
+const char* NTP_SERVIDOR_2 = "time.google.com";
+const char* NTP_SERVIDOR_3 = "time.nist.gov";
+const long  DESFASE_UTC_SEGUNDOS = -5 * 3600;  // UTC-5 (Colombia, sin horario de verano)
+
+// Cuanto se espera a que NTP conteste. El primer sincronizado incluye resolver
+// el DNS del pool, asi que necesita mas margen del que parece.
+const unsigned long ESPERA_NTP = 10000;
+
+// 2) API HTTP de respaldo, por si en esa red el puerto UDP 123 (NTP) esta
+//    bloqueado. Devuelve la hora en UTC y SIN segundos, asi que hay que
+//    restarle 5 horas; por eso es el plan B y no el principal.
+//
+//    OJO: aqui estaba worldtimeapi.org y era la razon por la que la hora no
+//    entraba nunca: ese servicio esta caido (acepta la conexion TCP y luego la
+//    corta sin responder). Se cambio por worldclockapi.com, que si responde por
+//    HTTP plano. Si algun dia este tambien muere, NTP sigue cubriendo el caso.
+const char* URL_API_HORA = "http://worldclockapi.com/api/json/utc/now";
+
+// Reintentos cuando no se pudo obtener la hora: al principio seguido (una red
+// recien conectada suele tardar un poco en enrutar), y luego mas espaciado
+// para no estar molestando cada minuto si de plano no hay salida a internet.
+const unsigned long REINTENTO_HORA_RAPIDO = 10000;
+const unsigned long REINTENTO_HORA_LENTO  = 60000;
+const uint8_t INTENTOS_HORA_RAPIDOS = 6;   // ~1 min de intentos seguidos
+
+// --- Servidor de telemetria ---
+const char* TELEMETRIA_HOST = "http://grupo1.requestcatcher.com";
+const char* TELEMETRIA_PATH = "/post";
+
+const unsigned long INTERVALO_ENVIO = 5000;    // un POST cada 5 s
+
+// Timeouts cortos: aunque el POST va en otra tarea, no queremos que un
+// servidor caido deje envios colgados acumulandose.
+const uint16_t TIMEOUT_HTTP_HORA = 3000;
+const uint16_t TIMEOUT_HTTP_POST = 2000;
 
 // ============================================================================
 // 4. MAQUINA DE ESTADOS
@@ -268,14 +365,55 @@ struct Instantanea {
 Instantanea instantaneas[MAX_SLOTS];
 
 // ============================================================================
-// 9. HORA INDICADA POR SERIAL Y NOCHE PROFUNDA
+// 9. RELOJ INTERNO (UTC-5) Y NOCHE PROFUNDA
 // ============================================================================
-// La placa no tiene reloj: la hora se le dice desde afuera con el comando
-// "hora <0-23>" (tambien acepta el formato "HORA:23"). Si la hora cae en la
-// franja 23h-4h Y los dos LDR ven poca luz, los semaforos pasan a modo
-// intermitente de madrugada: LY1 y LR2 parpadean juntos y el resto se apaga.
-int  horaActualIndicada = -1;            // -1 = todavia nadie dijo la hora
+// La placa no tiene reloj de verdad, asi que se "siembra" uno: se le da una
+// hora de partida (la que pide por WiFi al arrancar, o la que se fuerce con
+// "hora <0-23>") y desde ahi avanza sola contando millis(). Se guarda como
+// segundos transcurridos desde la medianoche.
+//
+// Si la hora cae en la franja 23h-4h Y los dos LDR ven poca luz, los
+// semaforos pasan a modo intermitente de madrugada: LY1 y LR2 parpadean
+// juntos y el resto se apaga.
+bool relojSincronizado = false;      // true cuando el reloj ya tiene hora valida
+unsigned long segundosBaseDia = 0;   // segundos desde medianoche al sembrarlo
+unsigned long millisBaseReloj = 0;   // valor de millis() en ese mismo instante
+String origenHora = "---";           // "API", "NTP" o "MANUAL"
+
+int  horaActualIndicada = -1;            // -1 = el reloj aun no tiene hora
 bool horaNocheProfundaIndicada = false;  // true si esa hora esta en 23h-4h
+
+// ============================================================================
+// 9.b ESTADO DE LA RED Y DE LA TELEMETRIA
+// ============================================================================
+bool wifiHabilitado = true;          // se puede apagar por consola ("wifi off")
+bool wifiConectado = false;
+unsigned long ultimoIntentoWiFi = 0;
+unsigned long ultimoIntentoHora = 0;
+uint8_t intentosHora = 0;            // para espaciar los reintentos poco a poco
+
+unsigned long ultimoEnvio = 0;
+int ultimoCodigoHttp = 0;            // codigo del ultimo POST (>0 = respondio)
+unsigned long enviosOk = 0;
+unsigned long enviosFallidos = 0;
+
+// Foto de los datos que se van a enviar. La rellena el loop y la lee la tarea
+// de red; envioEnCurso coordina el turno de cada uno, asi que no hace falta
+// un mutex: mientras es true, el loop no toca la struct.
+struct MuestraTrafico {
+  int autos1;
+  int autos2;
+  bool cny[6];
+  int co2;
+  bool noche;
+  char hora[9];        // "HH:MM:SS"
+  char fase[16];
+};
+
+MuestraTrafico muestraPendiente;
+volatile bool envioEnCurso = false;      // hay un POST pendiente o en marcha
+volatile bool solicitudHora = false;     // alguien pidio sincronizar la hora
+TaskHandle_t tareaRedHandle = NULL;
 
 bool modoNocheProfundaActivo = false;
 bool estadoParpadeoNocheProfunda = false;
@@ -323,6 +461,11 @@ void setup() {
   // damos por ausente y seguimos. Asi un LCD mal cableado nunca deja la
   // consola serial muda.
   Wire.begin();
+  // Sin timeout, si el bus se queda con SDA pegado a masa (ruido, un cable
+  // suelto) cualquier operacion I2C se bloquearia para siempre y con ella todo
+  // el cruce. Con 50 ms peor caso la operacion falla y vigilarLCD() lo detecta.
+  Wire.setTimeOut(50);
+
   Wire.beginTransmission(DIRECCION_LCD);
   lcdPresente = (Wire.endTransmission() == 0);
 
@@ -330,12 +473,17 @@ void setup() {
     lcd.init();
     lcd.backlight();
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(F("Ciudad Autoadapt."));
-    lcd.setCursor(0, 1);
-    lcd.print(F("Consola Serial"));
+    invalidarPantalla();
+
+    // Mensaje de bienvenida por la misma via que todo lo demas, para que el
+    // buffer y la pantalla arranquen sincronizados.
+    imprimirFila(0, "Ciudad Autoadapt");   // 16 chars justos (antes eran 17)
+    imprimirFila(1, "Consola Serial");
+    imprimirFila(2, "");
+    imprimirFila(3, "");
+    volcarPantalla();
     delay(1200);
-    lcd.clear();
+    limpiarLCD();
   }
 
 #ifdef RGB_BUILTIN
@@ -346,9 +494,16 @@ void setup() {
   duracionVerdeCalculada = verdeMinimo;
   aplicarSemaforos();
 
+  // --- Red ---
+  // A proposito NO esperamos aqui a que el WiFi conecte: la consola es lo
+  // primero que tiene que estar viva. Se lanza la conexion y la tarea de red
+  // se encarga del resto (pedir la hora en cuanto haya enlace, y los POST).
+  iniciarRed();
+
   Serial.println();
   Serial.println(F("=== CIUDAD AUTOADAPTABLE - CONSOLA LISTA ==="));
   Serial.println(F("Escribe 'ayuda' para ver todos los comandos."));
+  Serial.println(F("La hora se pide sola por WiFi; mira su estado con 'red'."));
   Serial.println();
 }
 
@@ -368,6 +523,10 @@ void loop() {
   atenderPrioridad();       // 8. emergencia: sostiene el verde de una calle
   actualizarEmergenciaCO2();// 9. CO2 critico: congela el ciclo y evacua por C2
 
+  mantenerWiFi();           // 10. vigila el enlace y reconecta, sin bloquear
+  actualizarReloj();        // 11. avanza la hora y recalcula la franja 23h-4h
+  programarEnvio();         // 12. cada 5 s deja una muestra lista para la tarea de red
+
   // La emergencia por CO2 manda sobre todo lo demas: mientras dure, ni la
   // maquina de estados ni el intermitente de madrugada tocan los semaforos.
   if (!emergenciaCO2Activa) {
@@ -376,6 +535,7 @@ void loop() {
   }
 
   aplicarSemaforos();       // se aplica cada vuelta: el brillo reacciona al instante
+  vigilarLCD();             // detecta y repara una pantalla colgada por ruido I2C
   actualizarLCD();
   imprimirMonitorContinuo();
 
@@ -385,9 +545,26 @@ void loop() {
 // ============================================================================
 // LECTURA (O SIMULACION) DE SENSORES
 // ============================================================================
+// ----------------------------------------------------------------------------
+// LECTURA ADC ROBUSTA (convivencia con el WiFi)
+// ----------------------------------------------------------------------------
+// LDR1(13), LDR2(12) y CO2(14) estan en el ADC2, que el ESP32-S3 comparte con
+// la radio WiFi: mientras la radio trabaja, analogRead() puede devolver 0
+// aunque el sensor tenga un valor real. Un 0 exacto no es una lectura fisica
+// plausible aqui (el divisor siempre deja algo de tension), asi que lo
+// tratamos como invalido y conservamos el ultimo valor bueno. Si no, el
+// sistema creeria que se hizo de noche de golpe cada vez que se manda un POST.
+void leerADC(int pin, int &destino) {
+  int lectura = analogRead(pin);
+  if (wifiConectado && lectura == 0 && destino != 0) return; // interferencia
+  destino = lectura;
+}
+
 void leerSensoresDetalle() {
-  luz1Actual = (simLdr[0] >= 0) ? simLdr[0] : analogRead(LDR1);
-  luz2Actual = (simLdr[1] >= 0) ? simLdr[1] : analogRead(LDR2);
+  // Si el valor esta simulado por consola se usa tal cual; el apaño del ADC2
+  // solo hace falta cuando se lee el sensor de verdad.
+  if (simLdr[0] >= 0) luz1Actual = simLdr[0]; else leerADC(LDR1, luz1Actual);
+  if (simLdr[1] >= 0) luz2Actual = simLdr[1]; else leerADC(LDR2, luz2Actual);
 
   for (int i = 0; i < 6; i++) {
     switch (modoCny[i]) {
@@ -413,7 +590,7 @@ bool cnyLeePin(int pin) {
 }
 
 void leerCO2() {
-  co2Actual = (simCo2 >= 0) ? simCo2 : analogRead(CO2);
+  if (simCo2 >= 0) co2Actual = simCo2; else leerADC(CO2, co2Actual);
 }
 
 void actualizarModoNoche() {
@@ -483,7 +660,9 @@ void pedirPeaton(int calle) {
 
 void cambiarModoPantalla() {
   modoPantalla = (modoPantalla + 1) % NUM_MODOS_PANTALLA;
-  if (lcdPresente) lcd.clear();
+  // Ya no hace falta limpiar aqui: cada fila se compone completa y rellenada
+  // con espacios en cada refresco, asi que no puede quedar residuo. Y quitarlo
+  // evita el parpadeo en negro que se veia al cambiar de pantalla.
   Serial.print(F("[EVENTO] Pantalla LCD -> M"));
   Serial.println(modoPantalla + 1);
 }
@@ -593,7 +772,13 @@ void aplicarSemaforos() {
     }
   }
 
-  int brilloBase = modoNoche ? brilloNoche : brilloDia;
+  // El brillo ya NO depende de los LDR. Antes era "modoNoche ? brilloNoche :
+  // brilloDia", asi que tapar los dos sensores atenuaba todos los semaforos;
+  // eso se quito a proposito. modoNoche se sigue calculando, pero solo como
+  // indicador (LCD, telemetria) y como condicion de la noche profunda.
+  // La variable brilloNoche se conserva para no romper los comandos ni el
+  // dashboard, pero ya no se aplica en ninguna parte.
+  int brilloBase = brilloDia;
   unsigned long ahora = millis();
 
   for (int i = 0; i < 6; i++) {
@@ -677,13 +862,13 @@ void actualizarEmergenciaCO2() {
   if (nivelPeligroso && !emergenciaCO2Activa) {
     emergenciaCO2Activa = true;
     modoNocheProfundaActivo = false;     // la emergencia manda sobre la madrugada
-    if (lcdPresente) lcd.clear();
+    limpiarLCD();
     avisoEvento(F("EMERGENCIA CO2: nivel critico. Evacuacion por la Calle 2."));
   } else if (!nivelPeligroso && emergenciaCO2Activa) {
     emergenciaCO2Activa = false;
     // La fase arranca de cero: no debe "recuperar" el tiempo de la emergencia.
     tiempoInicioFase = millis();
-    if (lcdPresente) lcd.clear();
+    limpiarLCD();
     avisoEvento(F("CO2 normalizado. Reanudando operacion normal."));
   }
 
@@ -742,27 +927,384 @@ void actualizarNocheProfunda() {
   }
 }
 
+/* ############################################################################
+   #                    RED: WIFI, HORA POR INTERNET Y POST                   #
+   ############################################################################
+   Reparto de responsabilidades:
+     - El LOOP nunca espera a la red. Solo mira el estado del enlace, avanza
+       el reloj y deja una muestra preparada cada 5 s.
+     - La TAREA DE RED (nucleo 0) es la unica que hace HTTP: pide la hora y
+       manda los POST. Puede tardar lo que haga falta sin afectar al cruce,
+       porque el loop de Arduino corre en el otro nucleo.
+   ######################################################################### */
+
 // ============================================================================
-// PANTALLA LCD I2C (16x4) - 4 MODOS
+// ARRANQUE DE LA RED
 // ============================================================================
-void actualizarLCD() {
+void iniciarRed() {
+  if (!wifiHabilitado) {
+    Serial.println(F("[WIFI] Deshabilitado por configuracion."));
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  ultimoIntentoWiFi = millis();
+
+  Serial.print(F("[WIFI] Conectando a '"));
+  Serial.print(WIFI_SSID);
+  Serial.println(F("' en segundo plano..."));
+
+  solicitudHora = true; // en cuanto haya enlace, la tarea pedira la hora
+
+  // 8 KB de pila: HTTPClient necesita bastante para sus buffers.
+  BaseType_t creada = xTaskCreatePinnedToCore(
+      tareaRed, "red", 8192, NULL, 1, &tareaRedHandle, 0);
+
+  if (creada != pdPASS) {
+    tareaRedHandle = NULL;
+    Serial.println(F("[WIFI] ERROR: no se pudo crear la tarea de red."));
+  }
+}
+
+// ============================================================================
+// VIGILANCIA DEL ENLACE (corre en el loop, nunca espera)
+// ============================================================================
+void mantenerWiFi() {
+  if (!wifiHabilitado) return;
+
+  bool conectadoAhora = (WiFi.status() == WL_CONNECTED);
+
+  if (conectadoAhora) {
+    if (!wifiConectado) {
+      wifiConectado = true;
+      Serial.print(F("[WIFI] Conectado. IP: "));
+      Serial.println(WiFi.localIP());
+      solicitudHora = true;   // enlace nuevo: aprovechamos para pedir la hora
+    }
+
+    // Si el reloj nunca llego a sincronizarse, se reintenta: seguido durante
+    // el primer minuto (una red recien conectada tarda un poco en enrutar) y
+    // mas espaciado despues, para no insistir cada minuto si no hay salida.
+    if (!relojSincronizado && !solicitudHora) {
+      unsigned long espera = (intentosHora < INTENTOS_HORA_RAPIDOS)
+                               ? REINTENTO_HORA_RAPIDO
+                               : REINTENTO_HORA_LENTO;
+      if ((millis() - ultimoIntentoHora) > espera) {
+        ultimoIntentoHora = millis();
+        if (intentosHora < 255) intentosHora++;
+        solicitudHora = true;
+      }
+    }
+
+    if (solicitudHora) despertarTareaRed();
+    return;
+  }
+
+  if (wifiConectado) {
+    wifiConectado = false;
+    Serial.println(F("[WIFI] Enlace perdido. Reintentando en segundo plano."));
+  }
+
+  if ((millis() - ultimoIntentoWiFi) > INTERVALO_REINTENTO_WIFI) {
+    ultimoIntentoWiFi = millis();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS); // no esperamos: el loop debe seguir
+  }
+}
+
+void despertarTareaRed() {
+  if (tareaRedHandle != NULL) xTaskNotifyGive(tareaRedHandle);
+}
+
+// ============================================================================
+// RELOJ INTERNO
+// ============================================================================
+
+// Deja el reloj en la hora indicada y anota desde que instante de millis()
+// empieza a contar. Es el unico sitio donde se pone en hora el sistema.
+void sembrarReloj(int h, int m, int s, const char* origen) {
+  segundosBaseDia = (unsigned long)h * 3600UL + (unsigned long)m * 60UL + (unsigned long)s;
+  millisBaseReloj = millis();
+  relojSincronizado = true;
+  origenHora = String(origen);
+  intentosHora = 0;   // ya hay hora: el contador de reintentos vuelve a cero
+
+  actualizarReloj();
+
+  Serial.print(F("[HORA] Reloj en hora ("));
+  Serial.print(origenHora);
+  Serial.print(F("): "));
+  Serial.print(horaFormateada());
+  Serial.println(F(" UTC-5"));
+}
+
+// Deja el reloj sin hora (equivale al comando "hora off")
+void olvidarReloj() {
+  relojSincronizado = false;
+  origenHora = "---";
+  horaActualIndicada = -1;
+  horaNocheProfundaIndicada = false;
+  intentosHora = 0;          // los reintentos vuelven a empezar seguidos
+  ultimoIntentoHora = millis();
+}
+
+unsigned long segundosDelDia() {
+  if (!relojSincronizado) return 0;
+  unsigned long transcurridos = (millis() - millisBaseReloj) / 1000UL;
+  return (segundosBaseDia + transcurridos) % 86400UL;
+}
+
+// Recalcula la hora vigente y, con ella, si estamos en la franja 23h-4h.
+// Antes esto solo cambiaba cuando alguien escribia "hora"; ahora se actualiza
+// sola en cada vuelta, asi que la noche profunda entra y sale por si misma.
+void actualizarReloj() {
+  if (!relojSincronizado) {
+    horaActualIndicada = -1;
+    horaNocheProfundaIndicada = false;
+    return;
+  }
+
+  int hora = (int)(segundosDelDia() / 3600UL);
+  horaActualIndicada = hora;
+  horaNocheProfundaIndicada = (hora >= 23 || hora <= 4);
+}
+
+String dosDigitos(int valor) {
+  return (valor < 10) ? ("0" + String(valor)) : String(valor);
+}
+
+String horaFormateada() {
+  if (!relojSincronizado) return "--:--:--";
+  unsigned long t = segundosDelDia();
+  return dosDigitos(t / 3600UL) + ":" +
+         dosDigitos((t % 3600UL) / 60UL) + ":" +
+         dosDigitos(t % 60UL);
+}
+
+String horaCorta() {
+  if (!relojSincronizado) return "--:--";
+  unsigned long t = segundosDelDia();
+  return dosDigitos(t / 3600UL) + ":" + dosDigitos((t % 3600UL) / 60UL);
+}
+
+// ============================================================================
+// TAREA DE RED (nucleo 0): lo unico que hace peticiones HTTP
+// ============================================================================
+void tareaRed(void *parametro) {
+  for (;;) {
+    // Duerme sin gastar CPU hasta que la despierten, o hasta 250 ms
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
+
+    if (WiFi.status() != WL_CONNECTED) continue;
+
+    if (solicitudHora) {
+      solicitudHora = false;
+      sincronizarHora();
+      // El reintento se cuenta desde que ESTE intento termino, no desde que se
+      // encolo: una sincronizacion puede tardar mas de 10 s entre el timeout de
+      // NTP y el de la API, y si no, el loop pediria otra estando esta a medias.
+      ultimoIntentoHora = millis();
+    }
+
+    if (envioEnCurso) {
+      enviarMuestra();
+      envioEnCurso = false;   // libera la struct para que el loop la reescriba
+    }
+  }
+}
+
+// ============================================================================
+// SINCRONIZACION DE LA HORA (UTC-5): primero NTP, y si falla la API HTTP
+// ============================================================================
+// El orden importa. NTP es el protocolo hecho para esto: no usa TLS, no hay
+// que parsear nada y funciona en casi cualquier red. La API HTTP queda como
+// plan B para redes donde el puerto UDP 123 este bloqueado.
+bool sincronizarHora() {
+  Serial.println(F("[HORA] Pidiendo la hora por NTP..."));
+  if (sincronizarHoraDesdeNTP()) return true;
+
+  Serial.println(F("[HORA] NTP no contesto. Probando la API HTTP..."));
+  if (sincronizarHoraDesdeAPI()) return true;
+
+  Serial.println(F("[HORA] Sin hora. Se reintentara; o ponla a mano con 'hora <0-23>'."));
+  return false;
+}
+
+// configTime aplica el desfase UTC-5, asi que la struct tm que devuelve
+// getLocalTime ya viene en hora de Colombia.
+bool sincronizarHoraDesdeNTP() {
+  configTime(DESFASE_UTC_SEGUNDOS, 0, NTP_SERVIDOR_1, NTP_SERVIDOR_2, NTP_SERVIDOR_3);
+
+  struct tm datos;
+  if (!getLocalTime(&datos, ESPERA_NTP)) {
+    Serial.println(F("[HORA] NTP no respondio a tiempo."));
+    return false;
+  }
+
+  sembrarReloj(datos.tm_hour, datos.tm_min, datos.tm_sec, "NTP");
+  return true;
+}
+
+// worldclockapi devuelve un JSON con el campo:
+//   "currentDateTime":"2026-09-10T03:33Z"
+// Es hora UTC y SIN segundos, asi que hay que restarle 5 horas a mano para
+// pasarla a UTC-5 y asumir segundo 0.
+bool sincronizarHoraDesdeAPI() {
+  HTTPClient http;
+  http.setConnectTimeout(TIMEOUT_HTTP_HORA);
+  http.setTimeout(TIMEOUT_HTTP_HORA);
+
+  if (!http.begin(URL_API_HORA)) {
+    Serial.println(F("[HORA] No se pudo abrir la conexion con la API."));
+    return false;
+  }
+
+  int codigo = http.GET();
+  if (codigo != HTTP_CODE_OK) {
+    Serial.print(F("[HORA] La API respondio con codigo "));
+    Serial.println(codigo);
+    http.end();
+    return false;
+  }
+
+  String cuerpo = http.getString();
+  http.end();
+
+  int posCampo = cuerpo.indexOf("\"currentDateTime\"");
+  if (posCampo < 0) {
+    Serial.println(F("[HORA] Respuesta sin campo currentDateTime."));
+    return false;
+  }
+
+  // Nos paramos en la 'T' que separa la fecha de la hora dentro de ese campo
+  int posT = cuerpo.indexOf('T', posCampo);
+  if (posT < 0 || cuerpo.length() < (unsigned int)(posT + 6)) {
+    Serial.println(F("[HORA] Formato de fecha inesperado."));
+    return false;
+  }
+
+  int hUtc = cuerpo.substring(posT + 1, posT + 3).toInt();
+  int m    = cuerpo.substring(posT + 4, posT + 6).toInt();
+
+  if (hUtc < 0 || hUtc > 23 || m < 0 || m > 59) {
+    Serial.println(F("[HORA] La API devolvio una hora fuera de rango."));
+    return false;
+  }
+
+  // UTC -> UTC-5, dando la vuelta si se pasa de medianoche hacia atras
+  int h = (hUtc + 24 + (int)(DESFASE_UTC_SEGUNDOS / 3600)) % 24;
+
+  sembrarReloj(h, m, 0, "API");
+  return true;
+}
+
+// ============================================================================
+// TELEMETRIA: POST con los vehiculos de cada calle (cada 5 s)
+// ============================================================================
+
+// Corre en el LOOP: solo toma la foto y avisa. No espera a la red.
+void programarEnvio() {
+  if (!wifiHabilitado) return;
+  if ((millis() - ultimoEnvio) < INTERVALO_ENVIO) return;
+  ultimoEnvio = millis();
+
+  if (!wifiConectado) return;   // sin enlace no hay nada que mandar
+
+  // Si el envio anterior sigue en marcha, saltamos este turno en vez de
+  // acumular retraso: mas vale perder una muestra que encolar envios.
+  if (envioEnCurso) {
+    Serial.println(F("[SEND] El envio anterior sigue en curso: turno omitido."));
+    return;
+  }
+
+  muestraPendiente.autos1 = autosCalle1Actual;
+  muestraPendiente.autos2 = autosCalle2Actual;
+  for (int i = 0; i < 6; i++) muestraPendiente.cny[i] = cnyDetectaEstado[i];
+  muestraPendiente.co2 = co2Actual;
+  muestraPendiente.noche = modoNoche;
+  horaFormateada().toCharArray(muestraPendiente.hora, sizeof(muestraPendiente.hora));
+  nombreFaseLarga().toCharArray(muestraPendiente.fase, sizeof(muestraPendiente.fase));
+
+  envioEnCurso = true;
+  despertarTareaRed();
+}
+
+// Corre en la TAREA DE RED: aqui si se puede esperar a que conteste el servidor.
+// Se manda de dos formas para que sea comodo de revisar en requestcatcher:
+//   - en la query string (/post?vehiculos_calle1=2&vehiculos_calle2=1)
+//   - y en el cuerpo, como JSON con el detalle sensor por sensor
+void enviarMuestra() {
+  MuestraTrafico m = muestraPendiente;   // copia local
+
+  String url = String(TELEMETRIA_HOST) + TELEMETRIA_PATH +
+               "?vehiculos_calle1=" + String(m.autos1) +
+               "&vehiculos_calle2=" + String(m.autos2);
+
+  String cuerpo = "{";
+  cuerpo += "\"hora\":\"" + String(m.hora) + "\",";
+  cuerpo += "\"vehiculos_calle1\":" + String(m.autos1) + ",";
+  cuerpo += "\"vehiculos_calle2\":" + String(m.autos2) + ",";
+  cuerpo += "\"sensores_calle1\":[" + String(m.cny[0] ? 1 : 0) + "," +
+                                      String(m.cny[1] ? 1 : 0) + "," +
+                                      String(m.cny[2] ? 1 : 0) + "],";
+  cuerpo += "\"sensores_calle2\":[" + String(m.cny[3] ? 1 : 0) + "," +
+                                      String(m.cny[4] ? 1 : 0) + "," +
+                                      String(m.cny[5] ? 1 : 0) + "],";
+  cuerpo += "\"fase\":\"" + String(m.fase) + "\",";
+  cuerpo += "\"co2\":" + String(m.co2) + ",";
+  cuerpo += "\"modo_noche\":" + String(m.noche ? "true" : "false");
+  cuerpo += "}";
+
+  HTTPClient http;
+  http.setConnectTimeout(TIMEOUT_HTTP_POST);
+  http.setTimeout(TIMEOUT_HTTP_POST);
+
+  if (!http.begin(url)) {
+    Serial.println(F("[SEND] No se pudo abrir la conexion con el servidor."));
+    ultimoCodigoHttp = -1;
+    enviosFallidos++;
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  ultimoCodigoHttp = http.POST(cuerpo);
+  http.end();
+
+  Serial.print(F("[SEND] C1:"));
+  Serial.print(m.autos1);
+  Serial.print(F(" C2:"));
+  Serial.print(m.autos2);
+  Serial.print(F(" -> status "));
+  Serial.println(ultimoCodigoHttp);
+
+  if (ultimoCodigoHttp > 0) enviosOk++;
+  else enviosFallidos++;
+}
+
+// ============================================================================
+// PANTALLA LCD I2C (16x4) - 5 MODOS
+// ============================================================================
+// Compone la pantalla que toca y la vuelca al LCD. Es el unico punto del
+// programa donde se escribe de verdad en la pantalla.
+void pintarPantallaActual() {
   if (!lcdPresente || !lcdEncendido) return;
 
-  static unsigned long ultimaActualizacion = 0;
-  if (millis() - ultimaActualizacion < 400) return;
-  ultimaActualizacion = millis();
-
   // La emergencia por CO2 tapa cualquier otra pantalla mientras dure.
-  if (emergenciaCO2Activa) { dibujarPantallaEmergenciaCO2(); return; }
+  if (emergenciaCO2Activa) {
+    dibujarPantallaEmergenciaCO2();
+    volcarPantalla();
+    return;
+  }
 
   // Un mensaje libre (por ejemplo "AMBULANCIA") tapa las pantallas normales
   // mientras este vigente. Sirve para que la maqueta anuncie la emergencia.
   if (lcdTextoLibre.length() > 0) {
     if (lcdTextoHasta > 0 && millis() > lcdTextoHasta) {
-      lcdTextoLibre = "";
-      lcd.clear();
+      lcdTextoLibre = "";   // caduco: seguimos a la pantalla normal de abajo
     } else {
       dibujarTextoLibre();
+      volcarPantalla();
       return;
     }
   }
@@ -772,7 +1314,18 @@ void actualizarLCD() {
     case 1: dibujarPantallaCalle1();  break;
     case 2: dibujarPantallaCalle2();  break;
     case 3: dibujarPantallaSistema(); break;
+    case 4: dibujarPantallaRed();     break;
   }
+
+  volcarPantalla();
+}
+
+void actualizarLCD() {
+  static unsigned long ultimaActualizacion = 0;
+  if (millis() - ultimaActualizacion < INTERVALO_REFRESCO_LCD) return;
+  ultimaActualizacion = millis();
+
+  pintarPantallaActual();
 }
 
 // Parte el mensaje en trozos de 16 caracteres y lo reparte en las 4 filas,
@@ -796,12 +1349,137 @@ void dibujarTextoLibre() {
   }
 }
 
+// ============================================================================
+// RENDERIZADO DEL LCD POR DIFERENCIAS
+// ============================================================================
+// ANTES: cada refresco reescribia las 4 filas enteras, y cada fila se borraba
+// con 16 espacios antes de escribir el texto. Son ~128 caracteres por refresco
+// sobre un bus I2C a 100 kHz, varias veces por segundo. Eso trae dos problemas:
+// el bus va saturado (mas ocasiones de corromperse por ruido, y ahi el LCD se
+// queda pillado sin poder recuperarse solo) y se ve parpadeo, porque entre el
+// borrado y la escritura la fila queda un instante en blanco.
+//
+// AHORA: imprimirFila() no toca el LCD, solo deja el texto en un buffer de
+// memoria. Al final del refresco, volcarPantalla() compara ese buffer con lo
+// que ya hay en pantalla y manda SOLO los caracteres distintos: en reposo son
+// 2 o 3 (los digitos del reloj) en vez de 128.
+//
+// Efecto secundario util: como cada fila se compone completa y rellenada con
+// espacios, es imposible que queden residuos de un texto anterior mas largo,
+// que era justo lo que el borrado con espacios trataba de evitar.
+
+// Deja el texto de una fila en el buffer, recortado o rellenado a 16 chars.
 void imprimirFila(int fila, String texto) {
-  lcd.setCursor(0, fila);
-  lcd.print(F("                "));
-  lcd.setCursor(0, fila);
-  if (texto.length() > 16) texto = texto.substring(0, 16);
-  lcd.print(texto);
+  if (fila < 0 || fila >= LCD_FILAS) return;
+  for (uint8_t c = 0; c < LCD_COLUMNAS; c++) {
+    lcdDeseado[fila][c] = (c < texto.length()) ? texto[c] : ' ';
+  }
+}
+
+// Marca toda la pantalla como "desconocida" para forzar un redibujado
+// completo. Se usa tras un lcd.clear(), tras reinicializar el LCD o al
+// escribir en el directamente: en esos casos el buffer de lo que creiamos
+// tener en pantalla ya no es de fiar.
+void invalidarPantalla() {
+  for (uint8_t f = 0; f < LCD_FILAS; f++) {
+    for (uint8_t c = 0; c < LCD_COLUMNAS; c++) lcdEnPantalla[f][c] = '\0';
+  }
+}
+
+// Borra la pantalla de verdad. SIEMPRE hay que limpiar por aqui y nunca con
+// lcd.clear() suelto: si se borra el LCD sin invalidar el buffer, el
+// renderizador cree que el contenido sigue ahi, no reescribe nada y la
+// pantalla se queda en blanco para siempre.
+void limpiarLCD() {
+  if (!lcdPresente) return;
+  lcd.clear();
+  invalidarPantalla();
+}
+
+// Compara buffer deseado vs pantalla y escribe solo los tramos que difieren.
+// Los tramos separados por 1 o 2 caracteres iguales se fusionan: reposicionar
+// el cursor cuesta lo mismo que escribir un caracter, asi que saltar huecos
+// tan cortos saldria mas caro que reescribirlos.
+void volcarPantalla() {
+  if (!lcdPresente || !lcdEncendido) return;
+
+  for (uint8_t f = 0; f < LCD_FILAS; f++) {
+    uint8_t c = 0;
+    while (c < LCD_COLUMNAS) {
+      if (lcdDeseado[f][c] == lcdEnPantalla[f][c]) { c++; continue; }
+
+      uint8_t inicio = c;
+      uint8_t fin = c;              // ultimo caracter distinto encontrado
+      uint8_t igualesSeguidos = 0;
+
+      for (uint8_t j = c; j < LCD_COLUMNAS && igualesSeguidos <= 2; j++) {
+        if (lcdDeseado[f][j] != lcdEnPantalla[f][j]) { fin = j; igualesSeguidos = 0; }
+        else igualesSeguidos++;
+      }
+
+      lcd.setCursor(inicio, f);
+      for (uint8_t k = inicio; k <= fin; k++) {
+        lcd.write(lcdDeseado[f][k]);
+        lcdEnPantalla[f][k] = lcdDeseado[f][k];
+      }
+
+      c = fin + 1;
+    }
+  }
+}
+
+// ============================================================================
+// VIGILANCIA DEL BUS I2C
+// ============================================================================
+// El HD44780 no avisa de nada: si un pico de ruido le corrompe un comando, se
+// queda mostrando basura (o nada) para siempre. Lo que si podemos hacer es
+// preguntarle al expansor I2C si sigue respondiendo, y reinicializar si no.
+bool lcdResponde() {
+  Wire.beginTransmission(DIRECCION_LCD);
+  return (Wire.endTransmission() == 0);   // 0 = contesto ACK
+}
+
+// Reinicializa el LCD y lo repinta en el acto. El repintado inmediato importa:
+// si esperasemos al siguiente refresco, la pantalla se quedaria en blanco casi
+// medio segundo y el parpadeo seria bien visible.
+void reiniciarLCD(const __FlashStringHelper* motivo) {
+  if (!lcdPresente) return;
+
+  recuperacionesLCD++;
+  Serial.print(F("[LCD] Reinicializando pantalla ("));
+  Serial.print(motivo);
+  Serial.print(F(") #"));
+  Serial.println(recuperacionesLCD);
+
+  lcd.init();
+  if (lcdEncendido) lcd.backlight(); else lcd.noBacklight();
+  invalidarPantalla();
+  pintarPantallaActual();
+}
+
+void vigilarLCD() {
+  if (!lcdPresente) return;
+
+  // --- Reinicio preventivo periodico ---
+  static unsigned long ultimoReinit = 0;
+  if (INTERVALO_REINIT_LCD > 0 && (millis() - ultimoReinit) >= INTERVALO_REINIT_LCD) {
+    ultimoReinit = millis();
+    reiniciarLCD(F("preventivo"));
+    return;
+  }
+
+  // --- Chequeo de que el expansor I2C sigue vivo ---
+  static unsigned long ultimoChequeo = 0;
+  if (millis() - ultimoChequeo < INTERVALO_CHEQUEO_LCD) return;
+  ultimoChequeo = millis();
+
+  if (lcdResponde()) { fallosI2CSeguidos = 0; return; }
+
+  fallosI2CSeguidos++;
+  if (fallosI2CSeguidos >= FALLOS_I2C_PARA_REINICIAR) {
+    reiniciarLCD(F("sin respuesta I2C"));
+    fallosI2CSeguidos = 0;
+  }
 }
 
 unsigned long duracionActualDeFase() {
@@ -864,8 +1542,11 @@ void dibujarPantallaResumen() {
   imprimirFila(1, "Resta:" + String(tiempoRestanteFase()) + "s CO2:" +
                   (co2Actual >= umbralCo2Alto ? "ALTO" : "OK"));
   imprimirFila(2, "Autos C1:" + String(autosCalle1Actual) + " C2:" + String(autosCalle2Actual));
-  imprimirFila(3, "Noche:" + String(modoNoche ? "SI" : "NO") + " Ped:" +
-                  String((solicitudPeaton1 || solicitudPeaton2) ? "SI" : "NO"));
+  // La fila 3 lleva el reloj en formato corto para tener la hora siempre a
+  // la vista sin cambiar de pantalla.
+  imprimirFila(3, "N:" + String(modoNoche ? "SI" : "NO") +
+                  " P:" + String((solicitudPeaton1 || solicitudPeaton2) ? "SI" : "NO") +
+                  " " + horaCorta());
 }
 
 void dibujarPantallaCalle1() {
@@ -891,6 +1572,16 @@ void dibujarPantallaSistema() {
   imprimirFila(1, "CO2 crudo:" + String(co2Actual));
   imprimirFila(2, "Luz1:" + String(luz1Actual) + " Luz2:" + String(luz2Actual));
   imprimirFila(3, nombreFaseLarga() + " " + String(tiempoRestanteFase()) + "s");
+}
+
+// --- M5: reloj y estado de la red (el "tablero digital" de la hora) ---
+void dibujarPantallaRed() {
+  imprimirFila(0, "--RED/HORA--  M5");
+  imprimirFila(1, horaFormateada() + " " + origenHora);
+  if (!wifiHabilitado)      imprimirFila(2, "WiFi: apagado");
+  else if (wifiConectado)   imprimirFila(2, WiFi.localIP().toString());
+  else                      imprimirFila(2, "WiFi: sin enlace");
+  imprimirFila(3, "POST ok:" + String(enviosOk) + " er:" + String(enviosFallidos));
 }
 
 void dibujarPantallaEmergenciaCO2() {

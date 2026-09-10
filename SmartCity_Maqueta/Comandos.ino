@@ -17,7 +17,7 @@
 
    CATEGORIAS (el catalogo del puente usa exactamente estos nombres, para
    poder mandarle al modelo solo la parte que le interesa):
-     sistema, semaforo, emergencia, luces, sensores, ambiente,
+     sistema, semaforo, emergencia, luces, sensores, ambiente, red,
      peatones, pantalla, tiempos, escenarios, programacion, diagnostico
    ========================================================================= */
 
@@ -182,6 +182,10 @@ void procesarComando(String lineaOriginal) {
   if (cmd == "hora")                                  { cmdHora(a1); return; }
   if (cmd.startsWith("hora:"))                        { cmdHora(cmd.substring(5)); return; }
 
+  // ---- red (WiFi, hora por internet, telemetria) ----
+  if (cmd == "red")                                   { cmdRed(a1); return; }
+  if (cmd == "resync")                                { cmdHora("sync"); return; }
+
   // ---- peatones ----
   if (cmd == "p1")                                    { pedirPeaton(1); return; }
   if (cmd == "p2")                                    { pedirPeaton(2); return; }
@@ -278,7 +282,7 @@ void terminarPrioridad(String motivo) {
   prioridadDuracion = 0;
   watchdogLimite = 0;
   lcdTextoLibre = "";
-  if (lcdPresente) lcd.clear();
+  limpiarLCD();
   restaurarInstantanea(0);
   avisoEvento(motivo + ". Sistema restaurado.");
 }
@@ -623,36 +627,109 @@ void cmdNoche(String valor) {
   avisoError("Uso: noche <on|off|auto>");
 }
 
-// hora <0-23>  -> le dice al sistema que hora es (la placa no tiene reloj).
-// hora off     -> se olvida la hora y no puede haber noche profunda.
-// hora         -> informa la hora que tiene guardada.
+// hora <0-23>  -> fuerza la hora del reloj interno (util para la demo).
+// hora off     -> deja el reloj sin hora: no puede haber noche profunda.
+// hora sync    -> vuelve a pedirle la hora real a internet.
+// hora         -> informa la hora que tiene el reloj ahora mismo.
+//
+// OJO: ya no basta con mover horaActualIndicada, porque actualizarReloj() la
+// recalcula en cada vuelta del loop a partir del reloj interno. Por eso el
+// comando siembra el reloj entero; desde ahi sigue avanzando solo, y la
+// franja 23h-4h entra y sale por si misma sin volver a escribir nada.
 // Si la hora cae en 23h-4h Y los dos LDR ven poca luz, arranca el
 // intermitente de madrugada (LY1 + LR2). Ver actualizarNocheProfunda().
 void cmdHora(String valor) {
   if (valor.length() == 0) {
-    if (horaActualIndicada < 0) { avisoOk("Sin hora indicada. Uso: hora <0-23>"); return; }
-    avisoOk("Hora indicada: " + String(horaActualIndicada) + "h" +
-            (horaNocheProfundaIndicada ? " (dentro de 23h-4h)" : " (fuera de 23h-4h)"));
+    if (!relojSincronizado) { avisoOk("Reloj sin hora. Uso: hora <0-23> / hora sync"); return; }
+    avisoOk("Hora: " + horaFormateada() + " UTC-5 (origen " + origenHora + ")" +
+            (horaNocheProfundaIndicada ? " [dentro de 23h-4h]" : " [fuera de 23h-4h]"));
     return;
   }
-  if (valor == "off" || valor == "auto" || valor == "limpiar") {
-    horaActualIndicada = -1;
-    horaNocheProfundaIndicada = false;
+
+  if (valor == "off" || valor == "limpiar") {
+    olvidarReloj();
     advertenciaHoraMostrada = false;
-    avisoOk("Hora olvidada: no habra noche profunda");
+    avisoOk("Reloj olvidado: no habra noche profunda");
     return;
   }
-  if (!esNumero(valor)) { avisoError("Uso: hora <0-23>  /  hora off"); return; }
+
+  // Sinonimos a proposito: es el comando para deshacer una hora forzada en una
+  // prueba, y quien lo busca lo va a llamar de cualquiera de estas formas.
+  if (valor == "sync" || valor == "auto" || valor == "red" ||
+      valor == "real" || valor == "ahora") {
+    if (!wifiConectado) { avisoError("No hay WiFi: no se puede sincronizar"); return; }
+    solicitudHora = true;
+    despertarTareaRed();
+    avisoOk("Sincronizacion pedida. Consulta el resultado con 'hora' o 'red'.");
+    return;
+  }
+
+  if (!esNumero(valor)) { avisoError("Uso: hora <0-23> / hora sync / hora off"); return; }
 
   int hora = valor.toInt();
   if (hora < 0 || hora > 23) { avisoError("Hora fuera de rango. Usa 0 a 23."); return; }
 
-  horaActualIndicada = hora;
-  horaNocheProfundaIndicada = (hora >= 23 || hora <= 4);
+  sembrarReloj(hora, 0, 0, "MANUAL");
   advertenciaHoraMostrada = false;
-  avisoOk("Hora recibida: " + String(hora) + "h" +
+  avisoOk("Hora forzada a " + String(hora) + "h" +
           (horaNocheProfundaIndicada ? " (dentro de 23h-4h: madrugada)"
                                      : " (fuera de ese rango)"));
+}
+
+// red        -> estado del WiFi, del reloj y de los envios
+// red on/off -> enciende o apaga toda la parte de red (hora + telemetria)
+void cmdRed(String opcion) {
+  if (opcion == "off") {
+    if (!wifiHabilitado) { avisoError("La red ya estaba apagada"); return; }
+    wifiHabilitado = false;
+    WiFi.disconnect(true);
+    wifiConectado = false;
+    avisoOk("Red apagada: sin hora por internet ni telemetria");
+    return;
+  }
+
+  if (opcion == "on") {
+    if (wifiHabilitado) { avisoError("La red ya estaba encendida"); return; }
+    wifiHabilitado = true;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    ultimoIntentoWiFi = millis();
+    solicitudHora = true;
+    avisoOk("Red encendida: conectando en segundo plano");
+    return;
+  }
+
+  if (opcion.length() > 0) { avisoError("Uso: red  /  red on  /  red off"); return; }
+
+  Serial.println(F("--------------------------------------------"));
+  Serial.print(F("WiFi             : "));
+  if (!wifiHabilitado)    Serial.println(F("APAGADO por consola"));
+  else if (wifiConectado) { Serial.print(F("conectado a ")); Serial.print(WIFI_SSID);
+                            Serial.print(F("  IP ")); Serial.println(WiFi.localIP()); }
+  else                    Serial.println(F("sin enlace (reintentando)"));
+
+  if (wifiConectado) {
+    Serial.print(F("Senal (RSSI)     : ")); Serial.print(WiFi.RSSI()); Serial.println(F(" dBm"));
+  }
+
+  Serial.print(F("Reloj            : "));
+  Serial.print(horaFormateada());
+  Serial.print(F("  (origen "));
+  Serial.print(origenHora);
+  Serial.println(F(")"));
+
+  Serial.print(F("Franja 23h-4h    : ")); Serial.println(horaNocheProfundaIndicada ? F("SI") : F("NO"));
+
+  Serial.print(F("Telemetria       : cada "));
+  Serial.print(INTERVALO_ENVIO / 1000);
+  Serial.print(F(" s -> "));
+  Serial.print(TELEMETRIA_HOST);
+  Serial.println(TELEMETRIA_PATH);
+
+  Serial.print(F("Envios OK / error: "));
+  Serial.print(enviosOk); Serial.print(F(" / ")); Serial.println(enviosFallidos);
+  Serial.print(F("Ultimo status    : ")); Serial.println(ultimoCodigoHttp);
+  Serial.println(F("--------------------------------------------"));
 }
 
 /* ============================================================================
@@ -687,7 +764,7 @@ void cmdPantalla(String valor) {
     if (n >= 1 && n <= NUM_MODOS_PANTALLA) {
       modoPantalla = n - 1;
       lcdTextoLibre = "";
-      if (lcdPresente) lcd.clear();
+      limpiarLCD();
       avisoOk("Pantalla LCD -> M" + String(n));
       return;
     }
@@ -702,19 +779,21 @@ void cmdLcd(String accion, String lineaOriginal) {
     if (mensaje.length() == 0) { avisoError("Uso: lcd texto <mensaje>"); return; }
     lcdTextoLibre = mensaje;
     lcdTextoHasta = 0;                 // permanente hasta 'lcd limpiar'
-    if (lcdPresente) lcd.clear();
+    limpiarLCD();
     avisoOk("LCD muestra: " + mensaje);
     return;
   }
   if (accion == "limpiar" || accion == "clear") {
     lcdTextoLibre = "";
-    if (lcdPresente) lcd.clear();
+    limpiarLCD();
     avisoOk("LCD vuelve a las pantallas normales");
     return;
   }
   if (!lcdPresente) { avisoError("No se detecto ningun LCD en el bus I2C"); return; }
-  if (accion == "on")  { lcdEncendido = true;  lcd.backlight(); avisoOk("LCD encendido"); return; }
-  if (accion == "off") { lcdEncendido = false; lcd.clear(); lcd.noBacklight(); avisoOk("LCD apagado"); return; }
+  // Al reencender hay que invalidar: mientras estuvo apagado el renderizador
+  // no escribio nada, asi que su idea de lo que hay en pantalla es de antes.
+  if (accion == "on")  { lcdEncendido = true;  lcd.backlight(); invalidarPantalla(); avisoOk("LCD encendido"); return; }
+  if (accion == "off") { lcdEncendido = false; limpiarLCD(); lcd.noBacklight(); avisoOk("LCD apagado"); return; }
   avisoError("Uso: lcd <on|off|limpiar>  /  lcd texto <mensaje>");
 }
 
@@ -769,7 +848,9 @@ void cmdSet(String parametro, String valor) {
   else if (parametro == "umbralnoche") { umbralNoche = v;      avisoOk("umbralnoche = " + String(v)); }
   else if (parametro == "umbralco2")   { umbralCo2Alto = v;    avisoOk("umbralco2 = " + String(v)); }
   else if (parametro == "brillodia")   { brilloDia = limitar(v, 0, 255);   avisoOk("brillodia = " + String(brilloDia)); }
-  else if (parametro == "brillonoche") { brilloNoche = limitar(v, 0, 255); avisoOk("brillonoche = " + String(brilloNoche)); }
+  // brillonoche se guarda por compatibilidad (snapshots, dashboard), pero ya
+  // no se aplica: la atenuacion nocturna de los LEDs se quito a proposito.
+  else if (parametro == "brillonoche") { brilloNoche = limitar(v, 0, 255); avisoOk("brillonoche = " + String(brilloNoche) + "  (SIN EFECTO: la atenuacion nocturna esta desactivada)"); }
   else if (parametro == "cnybajo")     { cnyActivoEnBajo = (v != 0);       avisoOk("cnybajo = " + String(cnyActivoEnBajo ? "1" : "0")); }
   else avisoError("Parametro desconocido: '" + parametro + "'");
 }
@@ -891,8 +972,9 @@ void cmdEscenario(String cual) {
   if (cual == "madrugada") {
     // Las dos condiciones a la vez: hora en 23h-4h y los dos LDR a oscuras.
     simLdr[0] = 100; simLdr[1] = 100; simNoche = -1;
-    horaActualIndicada = 2;
-    horaNocheProfundaIndicada = true;
+    // Hay que sembrar el reloj entero, no solo la bandera: actualizarReloj()
+    // la recalcula en cada vuelta a partir del reloj interno y la borraria.
+    sembrarReloj(2, 0, 0, "MANUAL");
     advertenciaHoraMostrada = false;
     avisoOk("Escenario: madrugada (2h y oscuro) -> LY1 y LR2 intermitentes");
     return;
@@ -986,12 +1068,16 @@ void resetSimulaciones() {
   botonesFisicosActivos = true;
   solicitudPeaton1 = false;
   solicitudPeaton2 = false;
-  horaActualIndicada = -1;
-  horaNocheProfundaIndicada = false;
+  // "Todo en AUTO" tambien vale para la hora: se descarta la que se haya
+  // forzado a mano y se vuelve a pedir la real a internet. Si no hay WiFi,
+  // el reloj queda sin hora (y por tanto sin noche profunda), que es el
+  // equivalente honesto a "no lo sé".
+  olvidarReloj();
+  if (wifiConectado) { solicitudHora = true; despertarTareaRed(); }
   modoNocheProfundaActivo = false;
   advertenciaHoraMostrada = false;
   lcdTextoLibre = "";
-  if (lcdPresente) lcd.clear();
+  limpiarLCD();
   for (int i = 0; i < MAX_PROGRAMADOS; i++) programadoActivo[i] = false;
   tiempoInicioFase = millis();
   avisoOk("Todo en AUTO: sensores reales, LEDs siguiendo al semaforo.");
@@ -1122,6 +1208,8 @@ void emitirJson() {
   jsonCampoBool("noche", modoNoche);
   jsonCampo("nocheSim", simNoche);
   jsonCampo("hora", horaActualIndicada);
+  jsonCampoTexto("horaReloj", horaFormateada());   // "HH:MM:SS" del reloj UTC-5
+  jsonCampoTexto("horaOrigen", origenHora);        // API / NTP / MANUAL / ---
   jsonCampoBool("horaMadrugada", horaNocheProfundaIndicada);
   jsonCampoBool("nocheProfunda", modoNocheProfundaActivo);
   jsonArreglo("ped", ped, 2);
@@ -1144,6 +1232,14 @@ void emitirJson() {
   jsonCampo("programados", programados);
   jsonArreglo("flujo", flujoPorMinuto, 2);
   jsonCampoBool("ruido", ruidoSensores);
+
+  // --- Estado de la red (WiFi + telemetria HTTP) ---
+  jsonCampoBool("wifiOn", wifiHabilitado);
+  jsonCampoBool("wifi", wifiConectado);
+  jsonCampoTexto("ip", wifiConectado ? WiFi.localIP().toString() : String(""));
+  jsonCampo("envios", (long)enviosOk);
+  jsonCampo("enviosError", (long)enviosFallidos);
+  jsonCampo("ultimoHttp", ultimoCodigoHttp);
 
   Serial.print(F(",\"cfg\":{\"verdemin\":"));
   Serial.print(verdeMinimo);
@@ -1196,12 +1292,19 @@ void mostrarEstado() {
   Serial.println(co2Actual >= umbralCo2Alto ? F("  ALTO") : F("  OK"));
   if (emergenciaCO2Activa) Serial.println(F("EMERGENCIA CO2   : ACTIVA (evacuando por Calle 2)"));
 
-  Serial.print(F("Hora indicada    : "));
-  if (horaActualIndicada < 0) Serial.println(F("ninguna"));
+  Serial.print(F("Reloj (UTC-5)    : "));
+  if (!relojSincronizado) Serial.println(F("sin hora  (usa 'hora sync' o 'hora <0-23>')"));
   else {
-    Serial.print(horaActualIndicada);
-    Serial.println(horaNocheProfundaIndicada ? F("h  (23h-4h)") : F("h"));
+    Serial.print(horaFormateada());
+    Serial.print(F("  origen "));
+    Serial.print(origenHora);
+    Serial.println(horaNocheProfundaIndicada ? F("  (23h-4h)") : F(""));
   }
+
+  Serial.print(F("WiFi             : "));
+  if (!wifiHabilitado)    Serial.println(F("apagado"));
+  else if (wifiConectado) Serial.println(WiFi.localIP());
+  else                    Serial.println(F("sin enlace"));
   Serial.print(F("Noche profunda   : "));
   Serial.println(modoNocheProfundaActivo ? F("ACTIVA (LY1+LR2 intermitentes)") : F("no"));
 
@@ -1252,12 +1355,15 @@ void mostrarAyuda() {
   Serial.println(F("flujo <c1|c2> <autos/min> | flujo off | ruido <on|off>"));
   Serial.println(F("-- ambiente --"));
   Serial.println(F("ldr <1|2|all> <0-4095|auto> | co2 <valor|alto|bajo|auto>"));
-  Serial.println(F("noche <on|off|auto> | hora <0-23|off>  (23h-4h + LDR bajos"));
-  Serial.println(F("                                        = LY1+LR2 intermitentes)"));
+  Serial.println(F("noche <on|off|auto>"));
+  Serial.println(F("hora <0-23> | hora sync | hora off | hora   (23h-4h + LDR"));
+  Serial.println(F("                              bajos = LY1+LR2 intermitentes)"));
+  Serial.println(F("-- red --"));
+  Serial.println(F("red | red <on|off> | resync   (WiFi, hora UTC-5 y telemetria)"));
   Serial.println(F("-- peatones --"));
   Serial.println(F("p1 | p2 | peaton <c1|c2|limpiar> | botones <on|off>"));
   Serial.println(F("-- pantalla --"));
-  Serial.println(F("combo | pantalla <1-4> | lcd <on|off|limpiar>"));
+  Serial.println(F("combo | pantalla <1-5> | lcd <on|off|limpiar>   (M5 = red/hora)"));
   Serial.println(F("lcd texto <mensaje>"));
   Serial.println(F("-- tiempos --"));
   Serial.println(F("set <verdemin|verdemax|extension|amarillo|todorojo> <ms>"));

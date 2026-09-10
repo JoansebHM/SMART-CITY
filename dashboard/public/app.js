@@ -49,10 +49,12 @@ const GRUPOS = [
     ]
   },
   {
-    // La hora se la decimos nosotros: la placa no tiene reloj. Con la hora en
-    // 23h-4h Y los dos LDR bajos arranca la noche profunda (LY1+LR2).
+    // La placa lleva su propia hora (UTC-5, pedida por red al arrancar). Estos
+    // botones la fuerzan para probar: con la hora en 23h-4h Y los dos LDR bajos
+    // arranca la noche profunda (LY1+LR2). "Hora real" deshace la trampa.
     titulo: 'Hora del día',
     botones: [
+      ['Hora real', 'resync'],
       ['Son las 2:00', 'hora 2'],
       ['Son las 23:00', 'hora 23'],
       ['Son las 14:00', 'hora 14'],
@@ -223,11 +225,16 @@ function aplicarTelemetria(t) {
   const hayPeaton = (t.ped?.[0] === 1) || (t.ped?.[1] === 1);
   insignia('#insigniaPeaton', hayPeaton, hayPeaton ? 'Peatón esperando' : 'Sin peatones', 'encendida');
 
-  // Hora indicada por consola (-1 = nadie la ha dicho) y el intermitente de
+  // Hora del reloj de la placa (-1 = todavia no tiene) y el intermitente de
   // madrugada, que solo arranca si ademas los dos LDR ven poca luz.
+  // Se muestra la hora completa y de donde salio (NTP / API / MANUAL), que es
+  // justo lo que hace falta para saber si se esta viendo la hora real o una
+  // forzada a mano para una prueba.
   const hora = t.hora ?? -1;
+  const relojTexto = horaMinutos(t);
+  const origen = t.horaOrigen && t.horaOrigen !== '---' ? ` · ${t.horaOrigen}` : '';
   insignia('#insigniaHora', hora >= 0 && t.horaMadrugada,
-           hora < 0 ? 'Sin hora' : `${hora}:00`, 'encendida');
+           relojTexto ? `${relojTexto}${origen}` : 'Sin hora', 'encendida');
   insignia('#insigniaNocheProfunda', !!t.nocheProfunda,
            t.nocheProfunda ? 'NOCHE PROFUNDA' : 'Ciclo normal', 'alerta');
 
@@ -284,15 +291,20 @@ function medidor(id, valor, maximo, alerta) {
 /* ---------------------------------------------------------------------------
    RELOJ DIGITAL Y LUZ DEL MAPA
    ---------------------------------------------------------------------------
-   La placa no tiene reloj: solo sabe la hora que le dijimos con "hora <0-23>".
-   El panel muestra esa hora y le cuenta los minutos desde que la recibio, pero
-   los deja clavados en :59 para no ensenar nunca una hora distinta de la que
-   cree el firmware (que es la que decide la noche profunda).
+   La placa YA tiene reloj propio: al arrancar pide la hora real en UTC-5 (por
+   NTP, con una API HTTP de respaldo) y desde ahi la lleva ella con millis().
+   La telemetria la manda entera en `horaReloj` ("HH:MM:SS").
+
+   Antes esto no era asi: el firmware solo sabia la hora entera que se le decia
+   con "hora <0-23>", asi que este panel se inventaba los minutos contando el
+   tiempo desde que la recibio y los dejaba clavados en :59. Por eso el reloj
+   se quedaba pegado en cosas como "22:00": los minutos reales nunca llegaban.
+   Ahora se pinta tal cual viene de la placa.
+
+   `horaMinutos` se conserva como respaldo por si la placa corre un firmware
+   viejo que no manda `horaReloj`.
    El tinte del mapa es solo cosmetico: la logica sigue mirando los LDR.
 --------------------------------------------------------------------------- */
-let horaMostrada = -1;
-let horaRecibidaEn = 0;
-
 const NOMBRE_FRANJA = {
   sinhora: 'sin hora', madrugada: 'madrugada',
   dia: 'día', atardecer: 'atardecer', noche: 'noche'
@@ -306,24 +318,23 @@ function franjaDeHora(h) {
   return 'noche';
 }
 
+// "HH:MM:SS" -> "HH:MM". Devuelve null si la placa no mando una hora usable.
+function horaMinutos(t) {
+  const reloj = t.horaReloj;
+  if (typeof reloj !== 'string' || reloj.startsWith('--')) return null;
+  return reloj.slice(0, 5);
+}
+
 function pintarReloj(t) {
   const h = t.hora ?? -1;
-  if (h !== horaMostrada) {
-    horaMostrada = h;
-    horaRecibidaEn = Date.now();
-  }
 
   const franja = franjaDeHora(h);
   $('#mapa').dataset.franja = franja;
   $('#relojFranja').textContent = NOMBRE_FRANJA[franja];
 
-  if (h < 0) {
-    $('#relojHora').textContent = '--:--';
-    return;
-  }
-  const minutos = Math.min(59, Math.floor((Date.now() - horaRecibidaEn) / 60000));
-  $('#relojHora').textContent =
-    `${String(h).padStart(2, '0')}:${String(minutos).padStart(2, '0')}`;
+  // La hora completa de la placa; si no llega, al menos la hora en punto.
+  const texto = horaMinutos(t) ?? (h < 0 ? '--:--' : `${String(h).padStart(2, '0')}:00`);
+  $('#relojHora').textContent = texto;
 }
 
 function insignia(sel, activa, texto, clase) {

@@ -92,8 +92,72 @@ noche off         fuerza modo día
 noche auto        que lo decidan los LDR
 ```
 
-**Qué debe pasar:** en modo noche los LEDs bajan su brillo (PWM 255 → 60).
-El cambio se ve **al instante**, sin esperar el siguiente cambio de fase.
+**Qué debe pasar:** el indicador de la pantalla pasa de `DIA` a `NOC` y la
+telemetría marca `noche: true`.
+
+> ⚠️ **El modo noche ya NO atenúa los LEDs.** Antes, tapar los dos sensores
+> bajaba el brillo de todos los semáforos (PWM 255 → 60); esa atenuación se
+> quitó a propósito. Hoy `modoNoche` sirve solo como indicador y como una de
+> las dos condiciones de la noche profunda. `set brillonoche` se sigue
+> aceptando por compatibilidad, pero no tiene ningún efecto: para atenuar de
+> verdad usa el comando `brillo`.
+
+---
+
+## 5-bis. Hora, WiFi y envío de datos
+
+La maqueta se conecta al WiFi al arrancar y pide la hora real en zona
+**UTC-5**. Esa hora siembra un reloj interno que a partir de ahí **avanza
+solo**, sin volver a consultar internet.
+
+De dónde saca la hora, en orden:
+
+1. **NTP** (`pool.ntp.org`) — el método principal. Es el protocolo hecho para
+   esto: sin TLS, sin parsear nada, funciona en casi cualquier red.
+2. **API HTTP** (`worldclockapi.com`) — solo si el puerto UDP 123 está
+   bloqueado en esa red. Devuelve UTC sin segundos, así que se le restan 5 h.
+3. **A mano** con `hora <0-23>`, si no hay internet.
+
+> Si la hora aparece como `--:--:--`, mira el Monitor Serie: cada intento
+> deja una línea `[HORA] ...` diciendo exactamente qué falló.
+
+```
+red               estado del WiFi, del reloj y de los envíos
+red off           apaga la parte de red (sigue todo lo demás)
+red on            la vuelve a encender
+hora              qué hora tiene el reloj ahora mismo
+hora 23           fuerza la hora a mano (para la demo)
+resync            vuelve a la HORA REAL de internet
+hora off          deja el reloj sin hora
+```
+
+**Para deshacer una hora forzada en una prueba:** `resync`. Es el comando que
+devuelve el reloj a la hora real. También responde a `hora sync`, `hora real`
+y `hora ahora`, y en el dashboard es el botón **"Hora real"**.
+
+> No lo confundas con `hora off`: ese no restaura nada, deja el reloj *sin*
+> hora (y por tanto desactiva la noche profunda).
+
+En el dashboard, la insignia muestra de dónde salió la hora — `14:37 · NTP`
+frente a `23:00 · MANUAL` — para que se vea de un vistazo si estás mirando la
+hora real o una forzada.
+
+**Dónde verlo:** pantalla **M5** del LCD (`pantalla 5`), que muestra
+`HH:MM:SS`, el origen de la hora (API / NTP / MANUAL), la IP y el contador de
+envíos. La hora en formato corto también sale en la pantalla M1.
+
+**Envío de datos:** cada 5 segundos se manda un POST a
+`grupo1.requestcatcher.com/post` con el número de vehículos de cada calle,
+tanto en la query string como en un cuerpo JSON con el detalle. Ábrelo en el
+navegador y activa sensores CNY para verlo llegar en vivo.
+
+> El reloj avanza solo, así que `hora 23` no fija la madrugada para siempre:
+> si dejas correr la maqueta, acabará saliendo de la franja 23h-4h igual que
+> en la vida real. Para la demo de noche profunda, usa `escenario madrugada`.
+
+> La red **nunca bloquea el cruce**: todo el HTTP corre en una tarea aparte,
+> en el otro núcleo del ESP32-S3. Si no hay WiFi, la maqueta funciona igual y
+> reintenta por su cuenta.
 
 ---
 
@@ -185,8 +249,8 @@ set todorojo 500        pausa de seguridad en rojo (ms)
 
 set umbralnoche 1200    a partir de qué luz se considera noche
 set umbralco2 2000      a partir de qué valor el aire es "alto"
-set brillodia 255       PWM de los LEDs de día
-set brillonoche 30      PWM de los LEDs de noche
+set brillodia 255       PWM de los LEDs (el único que se aplica)
+set brillonoche 30      SIN EFECTO: la atenuación nocturna está desactivada
 set cnybajo 0           invierte la lógica de los CNY (0 o 1)
 ```
 
@@ -360,7 +424,7 @@ escenario horapico              tráfico continuo en las dos calles
 | `noche <on\|off\|auto>` | Forzar día o noche |
 | `co2 <0-4095\|alto\|bajo\|auto>` | Simular calidad del aire |
 | `p1` / `p2` | Simular botón peatonal |
-| `combo` / `pantalla <1-4>` | Cambiar pantalla LCD |
+| `combo` / `pantalla <1-5>` | Cambiar pantalla LCD (M5 = red/hora) |
 | `lcd <on\|off>` | Encender/apagar LCD |
 | `botones <on\|off>` | Habilitar/ignorar pulsadores reales |
 | `sem <auto\|manual>` | Ciclo automático o manual |
@@ -371,6 +435,8 @@ escenario horapico              tráfico continuo en las dos calles
 | `mon <on\|off\|json\|texto\|ms>` | Telemetría continua |
 | `json` | Un snapshot JSON del estado |
 | `escenario <nombre>` | Escenarios armados |
+| `red` / `red <on\|off>` | WiFi, reloj UTC-5 y telemetría |
+| `hora <0-23\|sync\|off>` / `resync` | Poner en hora el reloj interno |
 
 ---
 

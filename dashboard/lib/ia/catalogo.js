@@ -68,6 +68,12 @@ export const CATEGORIAS = {
              'ldr', 'luz ambiente', 'co2', 'aire', 'contaminacion', 'humo',
              'polucion', 'calidad', 'smog']
   },
+  red: {
+    titulo: 'WiFi, hora por internet y telemetria',
+    claves: ['red', 'wifi', 'internet', 'conexion', 'conectar', 'ip', 'senal',
+             'hora', 'reloj', 'sincronizar', 'sync', 'utc', 'telemetria',
+             'envio', 'enviar', 'post', 'servidor', 'nube']
+  },
   peatones: {
     titulo: 'Botones peatonales',
     claves: ['peaton', 'peatones', 'persona', 'gente', 'cruzar', 'cruce', 'boton',
@@ -265,18 +271,39 @@ export const COMANDOS = [
   {
     nombre: 'noche', categoria: 'ambiente',
     sintaxis: 'noche <on|off|auto>',
-    que: 'Fuerza modo noche (LEDs atenuados) o modo dia, o lo deja segun los LDR.',
-    ojo: 'Solo baja el brillo de los LEDs (brillonoche); NO pone los semaforos en amarillo intermitente. Eso es "escenario intermitente".',
+    que: 'Fuerza el indicador de modo noche, o lo deja segun los LDR.',
+    ojo: 'El modo noche YA NO atenua los LEDs: la atenuacion nocturna se quito, el brillo es el mismo de dia y de noche. Hoy modoNoche solo sirve de indicador (LCD y telemetria) y como una de las dos condiciones de la noche profunda. Tampoco pone los semaforos en amarillo intermitente: eso es "escenario intermitente".',
     args: [{ tipo: 'enum', valores: ['on', 'off', 'auto'] }],
     ejemplos: ['noche on', 'noche auto']
   },
   {
     nombre: 'hora', categoria: 'ambiente',
-    sintaxis: 'hora <0-23|off>',
-    que: 'Le dice al sistema que hora es (la placa no tiene reloj). Si la hora cae en la franja 23h-4h Y los dos LDR leen por debajo de umbralnoche, arranca la NOCHE PROFUNDA: LY1 y LR2 parpadean juntos y los demas LEDs se apagan.',
-    ojo: 'Por si sola no hace nada: hacen falta las DOS condiciones. Con la hora puesta pero con luz, el firmware solo avisa por consola. Para verlo de una usa "escenario madrugada". "hora off" olvida la hora.',
-    args: [{ tipo: 'texto', patron: /^(off|auto|limpiar|\d{1,2})$/ }],
-    ejemplos: ['hora 2', 'hora 14', 'hora off']
+    sintaxis: 'hora <0-23|sync|off>',
+    que: 'Pone en hora el reloj interno de la maqueta. La placa no tiene reloj de verdad: al arrancar pide la hora real en UTC-5 por WiFi y desde ahi avanza sola contando millis(). "hora <0-23>" la fuerza a mano, "hora sync" vuelve a pedirsela a internet, "hora off" la olvida. Si la hora cae en la franja 23h-4h Y los dos LDR leen por debajo de umbralnoche, arranca la NOCHE PROFUNDA: LY1 y LR2 parpadean juntos y los demas LEDs se apagan.',
+    ojo: 'La noche profunda necesita las DOS condiciones. Con la hora puesta pero con luz, el firmware solo avisa por consola; para verlo de una usa "escenario madrugada". El reloj avanza solo, asi que forzar "hora 23" y esperar un rato acabara saliendo de la franja. "hora sync" falla si no hay WiFi.',
+    args: [{ tipo: 'texto', patron: /^(off|sync|auto|red|real|ahora|limpiar|\d{1,2})$/ }],
+    ejemplos: ['hora 2', 'hora sync', 'hora off']
+  },
+
+  // ======================= RED =======================
+  // Ojo al orden: verificar-catalogo.js ejecuta los ejemplos en secuencia sobre
+  // una misma placa simulada, asi que "resync" va antes que "red off" (que deja
+  // el WiFi apagado y haria fallar cualquier sincronizacion posterior).
+  {
+    nombre: 'resync', categoria: 'red',
+    sintaxis: 'resync',
+    que: 'Vuelve a poner el reloj en la hora REAL pidiendosela a internet. Es el comando para deshacer una hora forzada a mano con "hora <0-23>" durante una prueba. Equivale a "hora sync" (tambien vale "hora real" y "hora ahora").',
+    ojo: 'Necesita WiFi conectado. La respuesta no es inmediata: la peticion la atiende la tarea de red, asi que hay que consultar despues con "hora" o "red". Si lo que se quiere es dejar el reloj SIN hora, eso es "hora off", no esto.',
+    args: [],
+    ejemplos: ['resync']
+  },
+  {
+    nombre: 'red', categoria: 'red',
+    sintaxis: 'red [on|off]',
+    que: 'Sin argumento, informa del estado del WiFi (enlace, IP, senal), del reloj UTC-5 y de los envios de telemetria. "red off" apaga toda la parte de red y "red on" la vuelve a encender.',
+    ojo: 'Apagar la red NO detiene la maqueta ni el dashboard: el cruce sigue igual y el dashboard sigue hablando por el puerto Serial. Lo que se pierde es la hora de internet y el POST cada 5 s. Con la red apagada, "hora sync" falla.',
+    args: [{ tipo: 'enum', valores: ['on', 'off'], opcional: true }],
+    ejemplos: ['red', 'red off']
   },
 
   // ======================= PEATONES =======================
@@ -322,9 +349,9 @@ export const COMANDOS = [
   },
   {
     nombre: 'pantalla', categoria: 'pantalla',
-    sintaxis: 'pantalla <1-4>',
-    que: 'Cambia a una de las 4 pantallas de informacion del LCD.',
-    args: [{ tipo: 'entero', min: 1, max: 4 }],
+    sintaxis: 'pantalla <1-5>',
+    que: 'Cambia a una de las 5 pantallas de informacion del LCD. M1 resumen, M2 Calle 1, M3 Calle 2, M4 sistema, M5 red y hora.',
+    args: [{ tipo: 'entero', min: 1, max: 5 }],
     ejemplos: ['pantalla 2']
   },
   {
@@ -339,7 +366,7 @@ export const COMANDOS = [
     nombre: 'set', categoria: 'tiempos',
     sintaxis: 'set <parametro> <valor>',
     que: 'Cambia un parametro en caliente. En MILISEGUNDOS: verdemin, verdemax, extension (ms extra por auto), amarillo, todorojo. En cuentas de ADC 0-4095: umbralnoche, umbralco2. En PWM 0-255: brillodia, brillonoche. Booleano 0/1: cnybajo.',
-    ojo: 'Cada parametro tiene su propia unidad; no todos son milisegundos. verdemin nunca debe quedar por encima de verdemax.',
+    ojo: 'Cada parametro tiene su propia unidad; no todos son milisegundos. verdemin nunca debe quedar por encima de verdemax. Y brillonoche se acepta y se guarda pero YA NO TIENE EFECTO: la atenuacion nocturna esta desactivada; para atenuar de verdad usa el comando "brillo".',
     args: [
       { tipo: 'enum', valores: ['verdemin', 'verdemax', 'extension', 'amarillo', 'todorojo',
                                 'umbralnoche', 'umbralco2', 'brillodia', 'brillonoche', 'cnybajo'] },

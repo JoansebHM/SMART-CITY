@@ -68,9 +68,27 @@ export class PlacaSimulada extends EventEmitter {
     this.programados = [];          // [{cuando, comando}]
     this.slots = {};                // instantaneas
 
-    // --- Hora indicada por consola y noche profunda (LY1 + LR2 intermitentes) ---
+    // --- Reloj interno (UTC-5) y noche profunda (LY1 + LR2 intermitentes) ---
+    // Igual que el firmware: se siembra una hora de partida y desde ahi avanza
+    // sola. En la maqueta real la hora inicial la pide por WiFi al arrancar;
+    // aqui el simulador no tiene red, asi que arranca sin hora hasta que se
+    // use "hora <0-23>" o "hora sync".
+    this.relojSincronizado = false;
+    this.segundosBaseDia = 0;
+    this.millisBaseReloj = Date.now();
+    this.origenHora = '---';
     this.horaIndicada = -1;
     this.horaMadrugada = false;
+
+    // --- Red simulada (WiFi + telemetria HTTP) ---
+    // El simulador finge que el WiFi conecta, para poder probar los comandos
+    // sin placa. Los envios se cuentan pero no salen a ninguna parte.
+    this.wifiHabilitado = true;
+    this.wifiConectado = true;
+    this.ipSimulada = '192.168.1.50';
+    this.enviosOk = 0;
+    this.enviosError = 0;
+    this.ultimoHttp = 200;
     this.nocheProfunda = false;
     this.parpNocheOn = false;
     this.parpNocheUlt = 0;
@@ -164,7 +182,10 @@ export class PlacaSimulada extends EventEmitter {
         case 'r2': on[0] = on[3] = true; break;
       }
     }
-    const brillo = this.noche ? this.cfg.brillonoche : this.cfg.brillodia;
+    // El brillo ya NO depende de los LDR: la atenuacion nocturna se quito del
+    // firmware, asi que aqui tampoco se aplica. cfg.brillonoche se conserva
+    // solo para que "set brillonoche" y el dashboard sigan funcionando.
+    const brillo = this.cfg.brillodia;
     const ahora = Date.now();
 
     const salida = on.map((encendido, i) => {
@@ -309,9 +330,56 @@ export class PlacaSimulada extends EventEmitter {
     if (this.emergenciaCO2 && this.fase !== 'v2') this.#cambiarFase('v2');
   }
 
+  // --------------------------------------------------------------------------
+  // RELOJ INTERNO (espejo del firmware)
+  // --------------------------------------------------------------------------
+  // Se siembra una hora de partida y desde ahi avanza sola. Por eso "hora 23"
+  // no fija la franja para siempre: si se deja correr, el reloj acaba saliendo
+  // de 23h-4h igual que en la maqueta real.
+  sembrarReloj(h, m, s, origen) {
+    this.segundosBaseDia = h * 3600 + m * 60 + s;
+    this.millisBaseReloj = Date.now();
+    this.relojSincronizado = true;
+    this.origenHora = origen;
+    this.actualizarReloj();
+  }
+
+  olvidarReloj() {
+    this.relojSincronizado = false;
+    this.origenHora = '---';
+    this.horaIndicada = -1;
+    this.horaMadrugada = false;
+  }
+
+  segundosDelDia() {
+    if (!this.relojSincronizado) return 0;
+    const transcurridos = Math.floor((Date.now() - this.millisBaseReloj) / 1000);
+    return (this.segundosBaseDia + transcurridos) % 86400;
+  }
+
+  actualizarReloj() {
+    if (!this.relojSincronizado) {
+      this.horaIndicada = -1;
+      this.horaMadrugada = false;
+      return;
+    }
+    const hora = Math.floor(this.segundosDelDia() / 3600);
+    this.horaIndicada = hora;
+    this.horaMadrugada = hora >= 23 || hora <= 4;
+  }
+
+  horaFormateada() {
+    if (!this.relojSincronizado) return '--:--:--';
+    const t = this.segundosDelDia();
+    const dd = (v) => String(v).padStart(2, '0');
+    return `${dd(Math.floor(t / 3600))}:${dd(Math.floor((t % 3600) / 60))}:${dd(t % 60)}`;
+  }
+
   // Noche profunda: hace falta la hora en 23h-4h Y los DOS LDR por debajo del
   // umbral. Mientras dure, LY1 y LR2 parpadean juntos.
   #atenderNocheProfunda() {
+    this.actualizarReloj(); // el reloj avanza solo, igual que en el firmware
+
     const l = this.ldr;
     const ambosBajos = l[0] < this.cfg.umbralnoche && l[1] < this.cfg.umbralnoche;
 
@@ -415,6 +483,8 @@ export class PlacaSimulada extends EventEmitter {
       noche: this.noche,
       nocheSim: this.simNoche,
       hora: this.horaIndicada,
+      horaReloj: this.horaFormateada(),
+      horaOrigen: this.origenHora,
       horaMadrugada: this.horaMadrugada,
       nocheProfunda: this.nocheProfunda,
       ped: [this.ped[0] ? 1 : 0, this.ped[1] ? 1 : 0],
@@ -436,6 +506,12 @@ export class PlacaSimulada extends EventEmitter {
       programados: this.programados.length,
       flujo: this.flujo,
       ruido: this.ruido,
+      wifiOn: this.wifiHabilitado,
+      wifi: this.wifiConectado,
+      ip: this.wifiConectado ? this.ipSimulada : '',
+      envios: this.enviosOk,
+      enviosError: this.enviosError,
+      ultimoHttp: this.ultimoHttp,
       cfg: { ...this.cfg }
     });
   }
@@ -667,32 +743,60 @@ export class PlacaSimulada extends EventEmitter {
       }
       case 'hora': {
         if (a1 === undefined) {
-          if (this.horaIndicada < 0) return this.#ok('Sin hora indicada. Uso: hora <0-23>');
-          return this.#ok(`Hora indicada: ${this.horaIndicada}h` +
-            (this.horaMadrugada ? ' (dentro de 23h-4h)' : ' (fuera de 23h-4h)'));
+          if (!this.relojSincronizado) return this.#ok('Reloj sin hora. Uso: hora <0-23> / hora sync');
+          return this.#ok(`Hora: ${this.horaFormateada()} UTC-5 (origen ${this.origenHora})` +
+            (this.horaMadrugada ? ' [dentro de 23h-4h]' : ' [fuera de 23h-4h]'));
         }
-        if (a1 === 'off' || a1 === 'auto' || a1 === 'limpiar') {
-          this.horaIndicada = -1;
-          this.horaMadrugada = false;
+        if (a1 === 'off' || a1 === 'limpiar') {
+          this.olvidarReloj();
           this.avisoHora = false;
-          return this.#ok('Hora olvidada: no habra noche profunda');
+          return this.#ok('Reloj olvidado: no habra noche profunda');
+        }
+        if (a1 === 'sync' || a1 === 'auto' || a1 === 'red' ||
+            a1 === 'real' || a1 === 'ahora') {
+          if (!this.wifiConectado) return this.#err('No hay WiFi: no se puede sincronizar');
+          // Sin red de verdad: el simulador siembra la hora del reloj del PC.
+          const d = new Date();
+          this.sembrarReloj(d.getHours(), d.getMinutes(), d.getSeconds(), 'API');
+          return this.#ok('Sincronizacion pedida. Consulta el resultado con \'hora\' o \'red\'.');
         }
         const h = num(a1);
-        if (h === null) return this.#err('Uso: hora <0-23>  /  hora off');
+        if (h === null) return this.#err('Uso: hora <0-23> / hora sync / hora off');
         if (h > 23) return this.#err('Hora fuera de rango. Usa 0 a 23.');
-        this.horaIndicada = h;
-        this.horaMadrugada = h >= 23 || h <= 4;
+        this.sembrarReloj(h, 0, 0, 'MANUAL');
         this.avisoHora = false;
-        return this.#ok(`Hora recibida: ${h}h` +
+        return this.#ok(`Hora forzada a ${h}h` +
           (this.horaMadrugada ? ' (dentro de 23h-4h: madrugada)' : ' (fuera de ese rango)'));
+      }
+      case 'resync':
+        return this.enviar('hora sync');
+      case 'red': {
+        if (a1 === 'off') {
+          if (!this.wifiHabilitado) return this.#err('La red ya estaba apagada');
+          this.wifiHabilitado = false;
+          this.wifiConectado = false;
+          return this.#ok('Red apagada: sin hora por internet ni telemetria');
+        }
+        if (a1 === 'on') {
+          if (this.wifiHabilitado) return this.#err('La red ya estaba encendida');
+          this.wifiHabilitado = true;
+          this.wifiConectado = true;
+          return this.#ok('Red encendida: conectando en segundo plano');
+        }
+        if (a1 !== undefined) return this.#err('Uso: red  /  red on  /  red off');
+        const estadoWifi = !this.wifiHabilitado ? 'APAGADO por consola'
+                         : this.wifiConectado ? `conectado  IP ${this.ipSimulada}`
+                         : 'sin enlace (reintentando)';
+        return this.#ok(`WiFi: ${estadoWifi} | Reloj: ${this.horaFormateada()} ` +
+          `(origen ${this.origenHora}) | Envios OK/error: ${this.enviosOk}/${this.enviosError}`);
       }
       case 'p1': this.ped[0] = true; return this.emit('consola', { nivel: 'evento', texto: '[EVENTO] Peaton solicito cruce en Calle 1' });
       case 'p2': this.ped[1] = true; return this.emit('consola', { nivel: 'evento', texto: '[EVENTO] Peaton solicito cruce en Calle 2' });
-      case 'combo': this.pantalla = (this.pantalla % 4) + 1; return this.emit('consola', { nivel: 'evento', texto: `[EVENTO] Pantalla LCD -> M${this.pantalla}` });
+      case 'combo': this.pantalla = (this.pantalla % 5) + 1; return this.emit('consola', { nivel: 'evento', texto: `[EVENTO] Pantalla LCD -> M${this.pantalla}` });
       case 'pantalla': {
         const n = num(a1);
-        if (n >= 1 && n <= 4) { this.pantalla = n; return this.#ok(`Pantalla LCD -> M${n}`); }
-        return this.#err('Uso: pantalla <1-4>');
+        if (n >= 1 && n <= 5) { this.pantalla = n; return this.#ok(`Pantalla LCD -> M${n}`); }
+        return this.#err('Uso: pantalla <1-5>');
       }
       case 'lcd':
         if (a1 === 'texto' || a1 === 'msg') {
@@ -751,7 +855,9 @@ export class PlacaSimulada extends EventEmitter {
           dia: () => { this.simLdr = [3000, 3000]; this.simNoche = -1; },
           madrugada: () => {
             this.simLdr = [100, 100]; this.simNoche = -1;
-            this.horaIndicada = 2; this.horaMadrugada = true; this.avisoHora = false;
+            // Hay que sembrar el reloj, no solo la bandera: actualizarReloj()
+            // la recalcula en cada vuelta y la borraria.
+            this.sembrarReloj(2, 0, 0, 'MANUAL'); this.avisoHora = false;
           },
           contaminacion: () => { this.simCo2 = this.cfg.umbralco2 + 500; this.modoCny = Array(6).fill('on'); },
           vacio: () => { this.modoCny = Array(6).fill('off'); this.simCo2 = 100; },
@@ -793,8 +899,10 @@ export class PlacaSimulada extends EventEmitter {
         this.ped = [false, false];
         this.lcdTexto = '';
         this.programados = [];
-        this.horaIndicada = -1;
-        this.horaMadrugada = false;
+        // "Todo en AUTO" tambien vale para la hora: se descarta la forzada a
+        // mano. En la maqueta real se vuelve a pedir a internet; aqui, sin red,
+        // el reloj queda sin hora.
+        this.olvidarReloj();
         this.nocheProfunda = false;
         this.avisoHora = false;
         return this.#ok('Todo en AUTO');
