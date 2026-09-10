@@ -120,7 +120,39 @@
 // ============================================================================
 // 2. CONFIGURACION DE LA PANTALLA LCD I2C (16 columnas x 4 filas)
 // ============================================================================
-LiquidCrystal_I2C lcd(0x27, 16, 4);
+const uint8_t LCD_DIRECCION = 0x27; // cambia a 0x3F si tu modulo usa esa
+const uint8_t LCD_COLUMNAS  = 16;
+const uint8_t LCD_FILAS     = 4;
+
+LiquidCrystal_I2C lcd(LCD_DIRECCION, LCD_COLUMNAS, LCD_FILAS);
+
+// --- Buffers para redibujar solo lo que cambia (ver volcarPantalla) ---
+// lcdEnPantalla = lo que creemos que el LCD esta mostrando ahora
+// lcdDeseado    = lo que queremos que muestre en el proximo refresco
+char lcdEnPantalla[LCD_FILAS][LCD_COLUMNAS];
+char lcdDeseado[LCD_FILAS][LCD_COLUMNAS];
+
+// Cada cuanto se refresca la pantalla
+const unsigned long INTERVALO_REFRESCO_LCD = 500;
+
+// Cada cuanto se comprueba que el LCD sigue respondiendo en el bus I2C
+const unsigned long INTERVALO_CHEQUEO_LCD = 2000;
+
+// Cada cuanto se reinicializa la pantalla "por si acaso" (0 = desactivado).
+// Hace falta porque el chequeo I2C solo detecta que el expansor deje de
+// contestar; si lo que se corrompe es un comando que llega al HD44780 (por
+// ejemplo un "display off"), el expansor sigue respondiendo tan normal y la
+// pantalla se queda en blanco para siempre. Reinicializar cada tanto la saca
+// de ese estado. El repintado es inmediato, asi que solo se ve un parpadeo
+// muy corto.
+const unsigned long INTERVALO_REINIT_LCD = 60000;
+
+// Cuantos chequeos seguidos deben fallar antes de reinicializar la pantalla.
+// Con 2 evitamos reinicios por un unico glitch suelto del bus.
+const uint8_t FALLOS_I2C_PARA_REINICIAR = 2;
+
+uint8_t fallosI2CSeguidos = 0;
+unsigned long recuperacionesLCD = 0; // cuantas veces hubo que resucitar la pantalla
 
 // ============================================================================
 // 3. PARAMETROS AJUSTABLES DEL SISTEMA
@@ -136,7 +168,7 @@ const unsigned long TIEMPO_TODO_ROJO   = 1000;
 
 const int UMBRAL_NOCHE = 1000;
 const int BRILLO_DIA   = 255;
-const int UMBRAL_CO2_ALTO = 2500;
+const int UMBRAL_CO2_ALTO = 20500;
 
 const unsigned long DEBOUNCE_MS = 200;
 
@@ -152,8 +184,8 @@ const int NUM_MODOS_PANTALLA = 5;
 // ============================================================================
 
 // --- Credenciales del WiFi al que se conecta la maqueta ---
-const char* WIFI_SSID = "hotspot";
-const char* WIFI_PASS = "isa20261";
+const char* WIFI_SSID = "Familia HM";
+const char* WIFI_PASS = "PepisySebas123*";
 
 // Cuanto esperamos como maximo a que conecte el WiFi durante el arranque.
 // Si se vence, la maqueta arranca igual en modo offline: los semaforos
@@ -175,7 +207,7 @@ const long  DESFASE_UTC_SEGUNDOS = -5 * 3600; // UTC-5, Colombia (sin horario de
 const unsigned long INTERVALO_REINTENTO_HORA = 60000;
 
 // --- Servidor de telemetria (mismo esquema del ejemplo de clase) ---
-const char* TELEMETRIA_HOST = "http://isa.requestcatcher.com";
+const char* TELEMETRIA_HOST = "http://grupo1.requestcatcher.com";
 const char* TELEMETRIA_PATH = "/post";
 
 // Cada cuanto se envian los datos de trafico
@@ -260,6 +292,24 @@ int ultimoCodigoHttp = 0;      // codigo de respuesta del ultimo POST (>0 = ok)
 unsigned long enviosOk = 0;
 unsigned long enviosFallidos = 0;
 
+// El POST se hace en una tarea aparte (ver tareaTelemetria) para que la espera
+// de red no congele el loop. Esta struct es la foto de los datos que se manda:
+// el loop la rellena, la tarea la lee. Solo escribe uno de los dos a la vez,
+// coordinados por envioEnCurso, asi que no hace falta un mutex.
+struct MuestraTrafico {
+  int autos1;
+  int autos2;
+  bool cny[6];
+  int co2;
+  bool noche;
+  char hora[9];       // "HH:MM:SS"
+  char fase[16];
+};
+
+MuestraTrafico muestraPendiente;
+volatile bool envioEnCurso = false;   // true mientras la tarea tiene un POST a medias
+TaskHandle_t tareaEnvioHandle = NULL;
+
 // ---------- Variables para el modo de parpadeo especial ----------
 bool modoNocheProfundaActivo = false;
 bool estadoParpadeoNocheProfunda = false;
@@ -309,15 +359,19 @@ void setup() {
   pinMode(LG2, OUTPUT);
 
   Wire.begin();
+  // Sin timeout, si el bus se queda con SDA pegado a masa (ruido, un cable
+  // suelto) cualquier lectura se bloquearia para siempre y con ella todo el
+  // cruce. Con 50 ms peor caso, la operacion falla y vigilarLCD() lo detecta.
+  Wire.setTimeOut(50);
+
   lcd.init();
   lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("Ciudad Autoadapt."));
-  lcd.setCursor(0, 1);
-  lcd.print(F("Inicializando..."));
+  invalidarPantalla();
+
+  mostrarMensajeArranque("Ciudad Autoadapt", "Inicializando...");
   delay(1500);
   lcd.clear();
+  invalidarPantalla();
 
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0); // apagado inicial
 
@@ -331,6 +385,18 @@ void setup() {
     delay(1500);
   }
   lcd.clear();
+  invalidarPantalla();
+
+  // La telemetria vive en el nucleo 0; el loop de Arduino corre en el 1. Asi
+  // una espera de red no puede congelar los semaforos ni el refresco del LCD.
+  // 8 KB de pila: HTTPClient necesita bastante para sus buffers.
+  BaseType_t creada = xTaskCreatePinnedToCore(
+      tareaTelemetria, "telemetria", 8192, NULL, 1, &tareaEnvioHandle, 0);
+
+  if (creada != pdPASS) {
+    tareaEnvioHandle = NULL;
+    Serial.println(F("[SEND]\tNo se pudo crear la tarea de telemetria."));
+  }
 
   tiempoInicioFase = millis();
   duracionVerdeCalculada = VERDE_MINIMO;
@@ -357,14 +423,10 @@ void loop() {
   if (!emergenciaCO2Activa) {
     actualizarMaquinaEstados();
     actualizarNocheProfunda();
-    actualizarLCD();
-  } else {
-    static unsigned long ultimaActualizacionEmergencia = 0;
-    if (millis() - ultimaActualizacionEmergencia >= 500) {
-      dibujarPantallaEmergenciaCO2();
-      ultimaActualizacionEmergencia = millis();
-    }
   }
+
+  vigilarLCD();   // detecta y repara una pantalla colgada por ruido en el I2C
+  actualizarLCD();
 
   delay(50);
 }
@@ -481,7 +543,9 @@ void leerBotones() {
 // Avanza a la siguiente pantalla de informacion (ciclico: 0,1,2,3,0,1...)
 void cambiarModoPantalla() {
   modoPantalla = (modoPantalla + 1) % NUM_MODOS_PANTALLA;
-  lcd.clear(); // limpieza total al cambiar de pantalla para no dejar residuos
+  // Ya no hace falta lcd.clear() aqui: cada fila se compone completa (rellenada
+  // con espacios) en cada refresco, asi que no puede quedar residuo. Y quitarlo
+  // evita el parpadeo en negro que se veia al cambiar de pantalla.
   Serial.print(F("Cambio a pantalla: "));
   Serial.println(modoPantalla + 1);
 }
@@ -619,7 +683,7 @@ void escribirLuz(int pin, bool encendido) {
     analogWrite(pin, 0);
     return;
   }
-  
+
   analogWrite(pin, BRILLO_DIA);
 }
 
@@ -628,18 +692,32 @@ void escribirLuz(int pin, bool encendido) {
 // ============================================================================
 // Se cambia de modo pulsando P1+P2 al mismo tiempo (ver leerBotones/
 // cambiarModoPantalla). Cada modo llama a su propia funcion de dibujo.
+// Compone la pantalla que toca y la vuelca al LCD. Es el unico punto del
+// programa donde se escribe de verdad en la pantalla.
+void pintarPantallaActual() {
+  // La pantalla de emergencia se compone por la misma via que las demas: asi
+  // entrar y salir de emergencia no puede dejar restos de la pantalla anterior.
+  if (emergenciaCO2Activa) {
+    dibujarPantallaEmergenciaCO2();
+  } else {
+    switch (modoPantalla) {
+      case 0: dibujarPantallaResumen();   break;
+      case 1: dibujarPantallaCalle1();    break;
+      case 2: dibujarPantallaCalle2();    break;
+      case 3: dibujarPantallaSistema();   break;
+      case 4: dibujarPantallaRed();       break;
+    }
+  }
+
+  volcarPantalla();
+}
+
 void actualizarLCD() {
   static unsigned long ultimaActualizacion = 0;
-  if (millis() - ultimaActualizacion < 500) return;
+  if (millis() - ultimaActualizacion < INTERVALO_REFRESCO_LCD) return;
   ultimaActualizacion = millis();
 
-  switch (modoPantalla) {
-    case 0: dibujarPantallaResumen();   break;
-    case 1: dibujarPantallaCalle1();    break;
-    case 2: dibujarPantallaCalle2();    break;
-    case 3: dibujarPantallaSistema();   break;
-    case 4: dibujarPantallaRed();       break;
-  }
+  pintarPantallaActual();
 }
 
 // ============================================================================
@@ -722,14 +800,134 @@ void actualizarEmergenciaCO2() {
   }
 }
 
-// Escribe una fila completa, limpiandola primero para que nunca queden
-// caracteres residuales de un texto mas largo mostrado antes.
+// ============================================================================
+// RENDERIZADO DEL LCD POR DIFERENCIAS
+// ============================================================================
+// ANTES: cada refresco reescribia las 4 filas enteras, y ademas cada fila se
+// borraba con 16 espacios antes de escribir el texto. Eso son ~128 caracteres
+// por refresco, cada 500 ms, sobre un bus I2C a 100 kHz. Dos consecuencias
+// malas: el bus va saturado (mas ocasiones de corromperse por ruido) y se ve
+// un parpadeo, porque entre el borrado y la escritura la fila queda en blanco.
+//
+// AHORA: imprimirFila() no toca el LCD, solo deja el texto en un buffer de
+// memoria (lcdDeseado). Al final del refresco, volcarPantalla() compara ese
+// buffer con lo que ya hay en pantalla y manda SOLO los caracteres distintos.
+// En reposo eso son 2 o 3 caracteres (los digitos del reloj) en vez de 128.
+//
+// Efecto secundario util: como cada fila se compone completa y rellena con
+// espacios, es imposible que queden residuos de un texto anterior mas largo,
+// que era justo lo que el borrado con espacios trataba de evitar.
+
+// Deja el texto de una fila en el buffer, recortado o rellenado a 16 chars.
 void imprimirFila(int fila, String texto) {
-  lcd.setCursor(0, fila);
-  lcd.print(F("                ")); // 16 espacios: borra la fila
-  lcd.setCursor(0, fila);
-  if (texto.length() > 16) texto = texto.substring(0, 16);
-  lcd.print(texto);
+  if (fila < 0 || fila >= LCD_FILAS) return;
+
+  for (uint8_t c = 0; c < LCD_COLUMNAS; c++) {
+    lcdDeseado[fila][c] = (c < texto.length()) ? texto[c] : ' ';
+  }
+}
+
+// Marca toda la pantalla como "desconocida" para forzar un redibujado
+// completo. Se usa tras un lcd.clear(), tras reinicializar el LCD o al
+// escribir en el directamente, porque en esos casos el buffer de lo que
+// creiamos tener en pantalla ya no es de fiar.
+void invalidarPantalla() {
+  for (uint8_t f = 0; f < LCD_FILAS; f++) {
+    for (uint8_t c = 0; c < LCD_COLUMNAS; c++) {
+      lcdEnPantalla[f][c] = '\0'; // valor imposible: obliga a reescribir
+    }
+  }
+}
+
+// Compara buffer deseado vs pantalla y escribe solo los tramos que difieren.
+// Los tramos separados por 1 o 2 caracteres iguales se fusionan: reposicionar
+// el cursor cuesta lo mismo que escribir un caracter, asi que saltar huecos
+// tan cortos saldria mas caro que reescribirlos.
+void volcarPantalla() {
+  for (uint8_t f = 0; f < LCD_FILAS; f++) {
+    uint8_t c = 0;
+    while (c < LCD_COLUMNAS) {
+      if (lcdDeseado[f][c] == lcdEnPantalla[f][c]) {
+        c++;
+        continue;
+      }
+
+      uint8_t inicio = c;
+      uint8_t fin = c;        // ultimo caracter distinto encontrado
+      uint8_t igualesSeguidos = 0;
+
+      for (uint8_t j = c; j < LCD_COLUMNAS && igualesSeguidos <= 2; j++) {
+        if (lcdDeseado[f][j] != lcdEnPantalla[f][j]) {
+          fin = j;
+          igualesSeguidos = 0;
+        } else {
+          igualesSeguidos++;
+        }
+      }
+
+      lcd.setCursor(inicio, f);
+      for (uint8_t k = inicio; k <= fin; k++) {
+        lcd.write(lcdDeseado[f][k]);
+        lcdEnPantalla[f][k] = lcdDeseado[f][k];
+      }
+
+      c = fin + 1;
+    }
+  }
+}
+
+// ============================================================================
+// VIGILANCIA DEL BUS I2C
+// ============================================================================
+// El HD44780 no avisa de nada: si un pico de ruido le corrompe un comando, se
+// queda mostrando basura (o nada) para siempre y no hay forma de que se
+// recupere solo. Lo que si podemos hacer es preguntarle al expansor I2C si
+// sigue respondiendo, y si no, reinicializar la pantalla.
+bool lcdResponde() {
+  Wire.beginTransmission(LCD_DIRECCION);
+  return (Wire.endTransmission() == 0); // 0 = el dispositivo contesto ACK
+}
+
+// Reinicializa el LCD y lo repinta en el acto. El repintado inmediato importa:
+// si esperasemos al siguiente refresco, la pantalla se quedaria en blanco medio
+// segundo y el parpadeo seria bien visible.
+void reiniciarLCD(const __FlashStringHelper* motivo) {
+  recuperacionesLCD++;
+  Serial.print(F("[LCD]\tReinicializando pantalla ("));
+  Serial.print(motivo);
+  Serial.print(F(") #"));
+  Serial.println(recuperacionesLCD);
+
+  lcd.init();
+  lcd.backlight();
+  invalidarPantalla();    // lo que creiamos tener en pantalla ya no vale
+  pintarPantallaActual(); // repinta ya, sin esperar al ciclo de refresco
+}
+
+void vigilarLCD() {
+  // --- Reinicio preventivo periodico ---
+  static unsigned long ultimoReinit = 0;
+  if (INTERVALO_REINIT_LCD > 0 && (millis() - ultimoReinit) >= INTERVALO_REINIT_LCD) {
+    ultimoReinit = millis();
+    reiniciarLCD(F("preventivo"));
+    return; // ya se repinto: no tiene sentido chequear el bus en la misma vuelta
+  }
+
+  // --- Chequeo de que el expansor I2C sigue vivo ---
+  static unsigned long ultimoChequeo = 0;
+  if (millis() - ultimoChequeo < INTERVALO_CHEQUEO_LCD) return;
+  ultimoChequeo = millis();
+
+  if (lcdResponde()) {
+    fallosI2CSeguidos = 0;
+    return;
+  }
+
+  fallosI2CSeguidos++;
+  if (fallosI2CSeguidos >= FALLOS_I2C_PARA_REINICIAR) {
+    reiniciarLCD(F("sin respuesta I2C"));
+    fallosI2CSeguidos = 0;
+  }
 }
 
 unsigned long duracionActualDeFase() {
@@ -1034,6 +1232,8 @@ String horaCorta() {
 //   - en la query string, como en el ejemplo de clase
 //     (/post?vehiculos_calle1=2&vehiculos_calle2=1)
 //   - y en el cuerpo, como JSON con el detalle sensor por sensor
+// Corre en el loop: solo toma la foto de los datos y despierta a la tarea.
+// No espera a la red, asi que nunca bloquea el cruce ni el refresco del LCD.
 void enviarDatosTrafico() {
   if ((millis() - ultimoEnvio) < INTERVALO_ENVIO) return;
   ultimoEnvio = millis();
@@ -1043,58 +1243,103 @@ void enviarDatosTrafico() {
     return;
   }
 
-  String url = String(TELEMETRIA_HOST) + TELEMETRIA_PATH +
-               "?vehiculos_calle1=" + String(autosCalle1Actual) +
-               "&vehiculos_calle2=" + String(autosCalle2Actual);
-
-  String cuerpo = "{";
-  cuerpo += "\"hora\":\"" + horaFormateada() + "\",";
-  cuerpo += "\"vehiculos_calle1\":" + String(autosCalle1Actual) + ",";
-  cuerpo += "\"vehiculos_calle2\":" + String(autosCalle2Actual) + ",";
-  cuerpo += "\"sensores_calle1\":[" + String(cny1Detecta ? 1 : 0) + "," +
-                                      String(cny2Detecta ? 1 : 0) + "," +
-                                      String(cny3Detecta ? 1 : 0) + "],";
-  cuerpo += "\"sensores_calle2\":[" + String(cny4Detecta ? 1 : 0) + "," +
-                                      String(cny5Detecta ? 1 : 0) + "," +
-                                      String(cny6Detecta ? 1 : 0) + "],";
-  cuerpo += "\"fase\":\"" + nombreFaseLarga() + "\",";
-  cuerpo += "\"co2\":" + String(co2Actual) + ",";
-  cuerpo += "\"modo_noche\":" + String(modoNoche ? "true" : "false");
-  cuerpo += "}";
-
-  HTTPClient http;
-  http.setConnectTimeout(TIMEOUT_HTTP_POST);
-  http.setTimeout(TIMEOUT_HTTP_POST);
-
-  if (!http.begin(url)) {
-    Serial.println(F("[SEND]\tNo se pudo abrir la conexion con el servidor."));
-    enviosFallidos++;
-    ultimoCodigoHttp = -1;
+  // Si el envio anterior sigue en marcha (red lenta), saltamos este turno en
+  // vez de acumular envios: mas vale perder una muestra que encolar retraso.
+  if (envioEnCurso) {
+    Serial.println(F("[SEND]\tEl envio anterior sigue en curso: turno omitido."));
     return;
   }
 
-  http.addHeader("Content-Type", "application/json");
-  ultimoCodigoHttp = http.POST(cuerpo);
-  http.end();
+  muestraPendiente.autos1 = autosCalle1Actual;
+  muestraPendiente.autos2 = autosCalle2Actual;
+  muestraPendiente.cny[0] = cny1Detecta;
+  muestraPendiente.cny[1] = cny2Detecta;
+  muestraPendiente.cny[2] = cny3Detecta;
+  muestraPendiente.cny[3] = cny4Detecta;
+  muestraPendiente.cny[4] = cny5Detecta;
+  muestraPendiente.cny[5] = cny6Detecta;
+  muestraPendiente.co2 = co2Actual;
+  muestraPendiente.noche = modoNoche;
+  horaFormateada().toCharArray(muestraPendiente.hora, sizeof(muestraPendiente.hora));
+  nombreFaseLarga().toCharArray(muestraPendiente.fase, sizeof(muestraPendiente.fase));
 
-  Serial.print(F("[SEND]\tCalle1: "));
-  Serial.print(autosCalle1Actual);
-  Serial.print(F(" | Calle2: "));
-  Serial.print(autosCalle2Actual);
-  Serial.print(F(" | status-code: "));
-  Serial.println(ultimoCodigoHttp);
+  envioEnCurso = true;
+  if (tareaEnvioHandle != NULL) {
+    xTaskNotifyGive(tareaEnvioHandle); // despierta a la tarea y volvemos al loop
+  } else {
+    envioEnCurso = false; // la tarea no arranco: no hay a quien avisar
+  }
+}
 
-  if (ultimoCodigoHttp > 0) enviosOk++;
-  else enviosFallidos++;
+// Corre en la tarea de telemetria (nucleo 0). Aqui SI se puede esperar a la
+// red todo lo que haga falta, porque el loop del cruce va por el otro nucleo.
+void tareaTelemetria(void *parametro) {
+  for (;;) {
+    // Duerme sin gastar CPU hasta que enviarDatosTrafico() la despierte
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    MuestraTrafico m = muestraPendiente; // copia local: el loop puede seguir
+
+    String url = String(TELEMETRIA_HOST) + TELEMETRIA_PATH +
+                 "?vehiculos_calle1=" + String(m.autos1) +
+                 "&vehiculos_calle2=" + String(m.autos2);
+
+    String cuerpo = "{";
+    cuerpo += "\"hora\":\"" + String(m.hora) + "\",";
+    cuerpo += "\"vehiculos_calle1\":" + String(m.autos1) + ",";
+    cuerpo += "\"vehiculos_calle2\":" + String(m.autos2) + ",";
+    cuerpo += "\"sensores_calle1\":[" + String(m.cny[0] ? 1 : 0) + "," +
+                                        String(m.cny[1] ? 1 : 0) + "," +
+                                        String(m.cny[2] ? 1 : 0) + "],";
+    cuerpo += "\"sensores_calle2\":[" + String(m.cny[3] ? 1 : 0) + "," +
+                                        String(m.cny[4] ? 1 : 0) + "," +
+                                        String(m.cny[5] ? 1 : 0) + "],";
+    cuerpo += "\"fase\":\"" + String(m.fase) + "\",";
+    cuerpo += "\"co2\":" + String(m.co2) + ",";
+    cuerpo += "\"modo_noche\":" + String(m.noche ? "true" : "false");
+    cuerpo += "}";
+
+    HTTPClient http;
+    http.setConnectTimeout(TIMEOUT_HTTP_POST);
+    http.setTimeout(TIMEOUT_HTTP_POST);
+
+    if (!http.begin(url)) {
+      Serial.println(F("[SEND]\tNo se pudo abrir la conexion con el servidor."));
+      enviosFallidos++;
+      ultimoCodigoHttp = -1;
+      envioEnCurso = false;
+      continue;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    ultimoCodigoHttp = http.POST(cuerpo);
+    http.end();
+
+    Serial.print(F("[SEND]\tCalle1: "));
+    Serial.print(m.autos1);
+    Serial.print(F(" | Calle2: "));
+    Serial.print(m.autos2);
+    Serial.print(F(" | status-code: "));
+    Serial.println(ultimoCodigoHttp);
+
+    if (ultimoCodigoHttp > 0) enviosOk++;
+    else enviosFallidos++;
+
+    envioEnCurso = false;
+  }
 }
 
 // Mensaje de dos lineas para las fases de arranque (WiFi, hora, etc.)
+// Este si escribe directo en el LCD, porque en el arranque todavia no hay
+// ciclo de refresco corriendo. Por eso invalida el buffer al final: lo que
+// creiamos tener en pantalla ya no coincide con la realidad.
 void mostrarMensajeArranque(const char* linea1, const char* linea2) {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(linea1);
   lcd.setCursor(0, 1);
   lcd.print(linea2);
+  invalidarPantalla();
 }
 
 // ============================================================================
@@ -1129,6 +1374,7 @@ void leerComandosSerial() {
       if (WiFi.status() == WL_CONNECTED) {
         sincronizarHora(true); // lo pidio una persona: si mostramos avance
         lcd.clear();
+        invalidarPantalla();
       } else {
         Serial.println(F("RESYNC ignorado: no hay WiFi."));
       }
@@ -1147,6 +1393,8 @@ void leerComandosSerial() {
       Serial.print(enviosOk);
       Serial.print('/');
       Serial.println(enviosFallidos);
+      Serial.print(F("[RED]\tRecuperaciones del LCD: "));
+      Serial.println(recuperacionesLCD);
     }
   }
 }
@@ -1220,5 +1468,5 @@ void dibujarPantallaEmergenciaCO2() {
   imprimirFila(0, "!! PELIGRO !!");
   imprimirFila(1, "CO2 CRITICO");
   imprimirFila(2, "Valor:" + String(co2Actual));
-  imprimirFila(3, "Evacuando Calle 2");
+  imprimirFila(3, "Evacuar Calle 2"); // 16 chars justos: antes se truncaba
 }
